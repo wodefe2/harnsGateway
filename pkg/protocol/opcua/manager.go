@@ -1,6 +1,7 @@
 package opcua
 
 import (
+	"fmt"
 	opcuaruntime "harnsgateway/pkg/protocol/opcua/runtime"
 	"harnsgateway/pkg/runtime"
 	"harnsgateway/pkg/runtime/constant"
@@ -8,14 +9,22 @@ import (
 	"harnsgateway/pkg/utils/randutil"
 	"harnsgateway/pkg/utils/uuidutil"
 	v1 "harnsgateway/pkg/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 )
 
 type OpcUaDeviceManager struct {
+}
+
+func validateVariableName(name string) error {
+	if strings.Count(name, "@") < 2 {
+		return fmt.Errorf("variable name %q must contain at least two \"@\"", name)
+	}
+	return nil
 }
 
 func (m *OpcUaDeviceManager) CreateDevice(deviceType v1.DeviceType) (runtime.Device, error) {
@@ -52,6 +61,9 @@ func (m *OpcUaDeviceManager) CreateDevice(deviceType v1.DeviceType) (runtime.Dev
 	}
 	if len(opcUaDevice.Variables) > 0 {
 		for _, variable := range opcUaDevice.Variables {
+			if err := validateVariableName(strings.TrimSpace(variable.Name)); err != nil {
+				return nil, err
+			}
 			d.Variables = append(d.Variables, &opcuaruntime.Variable{
 				DataType:     constant.StringToDataType[variable.DataType],
 				Name:         variable.Name,
@@ -123,6 +135,9 @@ func (m *OpcUaDeviceManager) UpdateDevice(id string, deviceType v1.DeviceType, d
 	// upsert
 	for _, ndv := range opcUaDevice.Variables {
 		name := strings.TrimSpace(ndv.Name)
+		if err := validateVariableName(name); err != nil {
+			return nil, err
+		}
 		if v, ok := copyDevice.VariablesMap[name]; ok {
 			v.DataType = constant.StringToDataType[ndv.DataType]
 			v.Name = ndv.Name

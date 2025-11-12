@@ -1,8 +1,6 @@
 package options
 
 import (
-	"github.com/go-redis/redis/v8"
-	"github.com/spf13/pflag"
 	"harnsgateway/cmd/gateway/config"
 	"harnsgateway/pkg/device"
 	"harnsgateway/pkg/gateway"
@@ -11,6 +9,9 @@ import (
 	"harnsgateway/pkg/storage"
 	"harnsgateway/pkg/ts"
 	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/spf13/pflag"
 )
 
 type Options struct {
@@ -32,14 +33,16 @@ type Options struct {
 }
 
 const (
-	_defaultPort          = "32200"
-	_defaultWait          = 15 * time.Second
-	_defaultRedisUrl      = "10.56.223.27:8596"
-	_defaultRedisPassword = "Di@redis#1TScsG"
+	_defaultPort = "32200"
+	_defaultWait = 15 * time.Second
+	// _defaultRedisUrl      = "10.56.223.27:8596"
+	_defaultRedisUrl = "127.0.0.1:6379"
+	// _defaultRedisPassword = "Di@redis#1TScsG"
+	_defaultRedisPassword = ""
 	_defaultRedisDB       = 0
 	_defaultPlaceholder   = "@"
-	_defaultTsUrl         = "http://10.56.223.27:8086"
-	_defaultTsToken       = "Token c6jGYUCinwzeTWdeUh32"
+	_defaultTsUrl         = "http://localhost:8086"
+	_defaultTsToken       = "Token VMENkkxV5mjUfIacQZ134Dw8RfHXjrKidTK_Q8ZIzqFoNECDHVbPfG5Wyh5Sl1JhZWjG3qR0S3uHh39N3Sbnsg=="
 )
 
 // var (

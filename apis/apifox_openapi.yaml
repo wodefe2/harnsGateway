@@ -1,0 +1,905 @@
+openapi: 3.0.1
+info:
+  title: HarnsGateway REST APIs
+  version: 1.0.0
+  description: >-
+    Consolidated OpenAPI specification for all REST endpoints exposed by the
+    harnsgateway project. Import this file directly into Apifox to bootstrap the
+    workspace with sample payloads, error models, and server metadata for the
+    gateway/device, consumer/data, and CIM services.
+servers:
+  - url: http://localhost:8080
+    description: Gateway + device runtime (`cmd/gateway`)
+  - url: http://localhost:8081
+    description: Data ingestion runtime (`cmd/consumer` or `cmd/clickhouse`)
+  - url: http://localhost:8082
+    description: CIM sync trigger runtime (`cmd/cim`)
+tags:
+  - name: Devices
+    description: Device lifecycle, telemetry control, and file upload APIs.
+  - name: Gateway
+    description: Gateway metadata and host health metrics.
+  - name: Process Data
+    description: Tag name ingestion APIs served by the consumer service.
+  - name: CIM
+    description: CIM production data synchronization trigger.
+paths:
+  /api/v1/devices:
+    post:
+      tags: [Devices]
+      summary: Create a device
+      description: >-
+        Creates a Modbus, OPC UA, or S7 device definition. The payload MUST
+        contain `deviceType` so the backend can fan out to the correct validator.
+      operationId: createDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceUnion'
+            examples:
+              modbus:
+                summary: Modbus TCP meter
+                value:
+                  name: BoilerModbus01
+                  deviceCode: MODBUS-001
+                  deviceType: modbus
+                  deviceModel: Schneider-M340
+                  topic: factory/modbus/boiler01
+                  collectorCycle: 2000
+                  variableInterval: 200
+                  address:
+                    location: tcp://192.168.10.10
+                    option:
+                      port: 502
+                  slave: 1
+                  memoryLayout: ABCD
+                  positionAddress: 0
+                  variables:
+                    - dataType: float32
+                      name: Boiler01.Temp
+                      address: 40001
+                      bits: 0
+                      functionCode: 3
+                      rate: 0.1
+                      amount: 2
+                      defaultValue: 18.5
+                      accessMode: rw
+      responses:
+        '201':
+          description: Device created
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              description: Absolute URL of the newly created resource
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResource'
+              examples:
+                created:
+                  summary: Folded device snapshot
+                  value:
+                    name: BoilerModbus01
+                    id: 0bf9a4e4
+                    eTag: '1715852339000'
+                    modTime: '2024-05-16T01:32:19Z'
+                    deviceCode: MODBUS-001
+                    deviceType: modbus
+                    deviceModel: Schneider-M340
+                    collectStatus: collecting
+                    topic: factory/modbus/boiler01
+        default:
+          $ref: '#/components/responses/StandardError'
+    get:
+      tags: [Devices]
+      summary: List devices
+      description: >-
+        Returns device summaries by default. Set `exploded=true` to include full
+        per-type configuration (variables, addresses, etc.). Optional `filter`
+        accepts JSON encoded as a query value and is mapped onto
+        `runtime.DeviceFilter`.
+      operationId: listDevices
+      parameters:
+        - $ref: '#/components/parameters/Filter'
+        - $ref: '#/components/parameters/Exploded'
+      responses:
+        '200':
+          description: Device collection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceListResponse'
+              examples:
+                list:
+                  value:
+                    devices:
+                      - name: BoilerModbus01
+                        id: 0bf9a4e4
+                        eTag: '1715852339000'
+                        modTime: '2024-05-16T01:32:19Z'
+                        deviceCode: MODBUS-001
+                        deviceType: modbus
+                        deviceModel: Schneider-M340
+                        collectStatus: collecting
+                      - name: AHU_OpcUa_01
+                        id: 5c112f90
+                        eTag: '1715852444000'
+                        modTime: '2024-05-16T01:34:04Z'
+                        deviceCode: OPCUA-001
+                        deviceType: opcUa
+                        deviceModel: Kepware-Sim
+                        collectStatus: unconnected
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/devices/{id}:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [Devices]
+      summary: Get device by ID
+      operationId: getDevice
+      parameters:
+        - $ref: '#/components/parameters/Exploded'
+      responses:
+        '200':
+          description: Device detail
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResource'
+              examples:
+                exploded:
+                  summary: Exploded Modbus device
+                  value:
+                    name: BoilerModbus01
+                    id: 0bf9a4e4
+                    eTag: '1715852339000'
+                    modTime: '2024-05-16T01:32:19Z'
+                    deviceCode: MODBUS-001
+                    deviceType: modbus
+                    deviceModel: Schneider-M340
+                    collectStatus: collecting
+                    topic: factory/modbus/boiler01
+                    collectorCycle: 2000
+                    variableInterval: 200
+                    address:
+                      location: tcp://192.168.10.10
+                      option:
+                        port: 502
+                    slave: 1
+                    memoryLayout: ABCD
+                    positionAddress: 0
+                    variables:
+                      - dataType: float32
+                        name: Boiler01.Temp
+                        address: 40001
+                        bits: 0
+                        functionCode: 3
+                        rate: 0.1
+                        amount: 2
+                        defaultValue: 18.5
+                        accessMode: rw
+        default:
+          $ref: '#/components/responses/StandardError'
+    delete:
+      tags: [Devices]
+      summary: Delete device
+      operationId: deleteDevice
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Device deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResource'
+        '412':
+          description: Precondition failed (ETag mismatch)
+        default:
+          $ref: '#/components/responses/StandardError'
+    put:
+      tags: [Devices]
+      summary: Replace device definition
+      operationId: updateDevice
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceUnion'
+            examples:
+              opcua:
+                summary: OPC UA device update
+                value:
+                  name: AHU_OpcUa_01
+                  deviceCode: OPCUA-001
+                  deviceType: opcUa
+                  deviceModel: Kepware-Sim
+                  topic: factory/opcua/ahu1
+                  collectorCycle: 3000
+                  address:
+                    location: opc.tcp://192.168.20.10:4840
+                    option:
+                      port: 4840
+                      username: opcuser
+                      password: secret
+                  variables:
+                    - dataType: number
+                      name: AHU01.Temp
+                      address: ns=2;i=10856
+                      namespace: 2
+                      defaultValue: 23.5
+                      accessMode: rw
+      responses:
+        '200':
+          description: Device updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResource'
+        '412':
+          description: Precondition failed (ETag mismatch)
+        default:
+          $ref: '#/components/responses/StandardError'
+    patch:
+      tags: [Devices]
+      summary: Patch device definition
+      description: Supports JSON Patch and JSON Merge Patch payloads.
+      operationId: patchDevice
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json-patch+json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/JsonPatchOperation'
+            example:
+              - op: replace
+                path: /collectorCycle
+                value: 4000
+          application/merge-patch+json:
+            schema:
+              type: object
+            example:
+              collectorCycle: 4000
+              topic: factory/modbus/boiler01/redundant
+      responses:
+        '200':
+          description: Device patched
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResource'
+        '412':
+          description: Precondition failed (ETag mismatch)
+        '415':
+          description: Unsupported media type
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/devices/{id}/{status}:
+    put:
+      tags: [Devices]
+      summary: Switch device collection state
+      description: >-
+        Changes the collection state by enqueuing a `start`, `stop`, or
+        `restart` command.
+      operationId: switchDeviceStatus
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+        - $ref: '#/components/parameters/DeviceStatus'
+      responses:
+        '202':
+          description: Command accepted
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/devices/{id}/action:
+    put:
+      tags: [Devices]
+      summary: Deliver write actions to a device
+      description: >-
+        Each array item is a map whose keys are writable variable names and
+        values are the desired command values. Duplicate keys or read-only
+        variables are rejected as multi-errors.
+      operationId: controlDevice
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionCommandList'
+            example:
+              - Boiler01.TempSetpoint: 21.5
+              - Boiler01.Mode: auto
+      responses:
+        '202':
+          description: Actions accepted for delivery
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/devices/upload/{name}:
+    post:
+      tags: [Devices]
+      summary: Bulk update Modbus variables from Excel
+      description: >-
+        Expects a `.xlsx` file with the Modbus simulator layout. The `name`
+        parameter is matched against `device.name` to locate the runtime object.
+      operationId: uploadDeviceTemplate
+      parameters:
+        - $ref: '#/components/parameters/DeviceName'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Excel file exported from the Modbus simulator template
+              required: [file]
+      responses:
+        '202':
+          description: Upload accepted; variables rebuilt asynchronously
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/gatewayMeta:
+    get:
+      tags: [Gateway]
+      summary: Get gateway metadata
+      operationId: getGatewayMeta
+      responses:
+        '200':
+          description: Gateway identity information
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayMeta'
+              example:
+                secret: ''
+                name: harnsgateway
+                id: d1a6a3b6
+                eTag: '1709102233445'
+                modTime: '2024-02-28T09:17:13Z'
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/gatewayCpu:
+    get:
+      tags: [Gateway]
+      summary: Get CPU usage snapshots
+      operationId: getGatewayCpu
+      responses:
+        '200':
+          description: Rolling CPU utilization averages
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayCpuResponse'
+              example:
+                cpus:
+                  1min: '32%'
+                  5min: '35%'
+                  15min: '38%'
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/gatewayMem:
+    get:
+      tags: [Gateway]
+      summary: Get memory usage
+      operationId: getGatewayMem
+      responses:
+        '200':
+          description: Memory utilization snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayMemResponse'
+              example:
+                mem:
+                  total: 7456MB
+                  used: 3210MB
+                  usedPercent: '43%'
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/gatewayDisk:
+    get:
+      tags: [Gateway]
+      summary: Get disk usage by mount
+      operationId: getGatewayDisk
+      responses:
+        '200':
+          description: Disk utilization snapshot (note JSON key `disk`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayDiskResponse'
+              example:
+                disk:
+                  /:
+                    total: 512000MB
+                    used: 221000MB
+                    usedPercent: '43%'
+                  /data:
+                    total: 1024000MB
+                    used: 610000MB
+                    usedPercent: '60%'
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/tagNames:
+    post:
+      tags: [Process Data]
+      summary: Import tag names from Excel
+      operationId: importTagNames
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Spreadsheet with a single tag column (first row is header)
+              required: [file]
+      responses:
+        '200':
+          description: Tag names ingested and cached
+        default:
+          $ref: '#/components/responses/StandardError'
+    get:
+      tags: [Process Data]
+      summary: Get cached FMCS tag names
+      operationId: listTagNames
+      responses:
+        '200':
+          description: Tag names in the BoltDB cache
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagNamesResponse'
+              example:
+                tagNames:
+                  - FMCS.Line1.PCW01.VAL
+                  - FMCS.Line1.PCW01.VAL_Actl
+                  - FMCS.Line2.Pressure.VAL_Actl
+        default:
+          $ref: '#/components/responses/StandardError'
+  /api/v1/data:
+    get:
+      tags: [CIM]
+      summary: Trigger CIM data synchronization
+      description: >-
+        Asynchronously loads daily (`type=d`) or monthly (`type=m`) CIM data into
+        the EMS database. Returns immediately after queuing the job.
+      operationId: triggerCimSync
+      parameters:
+        - $ref: '#/components/parameters/CimTimeType'
+        - $ref: '#/components/parameters/CimTimeValue'
+      responses:
+        '200':
+          description: Sync triggered
+        default:
+          $ref: '#/components/responses/StandardError'
+components:
+  headers:
+    ETag:
+      description: Resource version used for optimistic locking
+      schema:
+        type: string
+  parameters:
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Device identifier (`runtime.DeviceMeta.id`).
+    DeviceStatus:
+      name: status
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [start, stop, restart]
+      description: Desired collector control action.
+    DeviceName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Logical `device.name` used to match upload targets.
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Latest `ETag` obtained from a read operation.
+    Exploded:
+      name: exploded
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: false
+      description: >-
+        When true, returns the full device definition including variables;
+        otherwise only metadata is returned.
+    Filter:
+      name: filter
+      in: query
+      required: false
+      schema:
+        type: string
+      description: JSON string conforming to `runtime.DeviceFilter` (supports `id`, `deviceType`, and advanced name filters).
+      example: '{"deviceType":"modbus","name":{"contains":"Pump"}}'
+    CimTimeType:
+      name: type
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [d, m]
+      description: >-
+        `d` to sync a single day (YYYYMMDD), `m` to backfill each day of a
+        month (YYYYMM).
+    CimTimeValue:
+      name: time
+      in: query
+      required: true
+      schema:
+        type: string
+      description: >-
+        For `type=d` use YYYYMMDD (e.g., 20240615). For `type=m` use YYYYMM
+        (e.g., 202406).
+  responses:
+    StandardError:
+      description: Structured multi-error response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            errors:
+              - code: 10003
+                message: Variable [Boiler01.Temp] already exists.
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+      required: [errors]
+    ResponseError:
+      type: object
+      properties:
+        code:
+          type: integer
+          format: int32
+        message:
+          type: string
+    DeviceMeta:
+      type: object
+      properties:
+        name:
+          type: string
+        id:
+          type: string
+        eTag:
+          type: string
+        modTime:
+          type: string
+          format: date-time
+        deviceCode:
+          type: string
+        deviceType:
+          type: string
+          enum: [modbus, opcUa, s7]
+        deviceModel:
+          type: string
+        collectStatus:
+          type: string
+          enum: [collecting, collectingError, unconnected, emptyVariable, stopped, error]
+        topic:
+          type: string
+          nullable: true
+    ModbusAddressOption:
+      type: object
+      properties:
+        port:
+          type: integer
+        baudRate:
+          type: integer
+        dataBits:
+          type: integer
+        parity:
+          type: string
+        stopBits:
+          type: string
+    ModbusAddress:
+      type: object
+      properties:
+        location:
+          type: string
+        option:
+          $ref: '#/components/schemas/ModbusAddressOption'
+    ModbusVariable:
+      type: object
+      properties:
+        dataType:
+          type: string
+          enum: [bool, int16, float32, float64, int32, int64, uint16]
+        name:
+          type: string
+        address:
+          type: integer
+        bits:
+          type: integer
+        functionCode:
+          type: integer
+          minimum: 1
+          maximum: 4
+        rate:
+          type: number
+        amount:
+          type: integer
+        defaultValue:
+          nullable: true
+        accessMode:
+          type: string
+          enum: [r, rw]
+      required: [dataType, name, address, functionCode, accessMode]
+    ModbusDevice:
+      allOf:
+        - $ref: '#/components/schemas/DeviceMeta'
+        - type: object
+          properties:
+            collectorCycle:
+              type: integer
+            variableInterval:
+              type: integer
+            address:
+              $ref: '#/components/schemas/ModbusAddress'
+            slave:
+              type: integer
+            memoryLayout:
+              type: string
+              enum: [ABCD, BADC, CDAB, DCBA]
+            positionAddress:
+              type: integer
+            variables:
+              type: array
+              items:
+                $ref: '#/components/schemas/ModbusVariable'
+          required: [collectorCycle, address, slave, memoryLayout, variables]
+    OpcAddressOption:
+      type: object
+      properties:
+        port:
+          type: integer
+        username:
+          type: string
+        password:
+          type: string
+    OpcAddress:
+      type: object
+      properties:
+        location:
+          type: string
+        option:
+          $ref: '#/components/schemas/OpcAddressOption'
+    OpcUaVariable:
+      type: object
+      properties:
+        dataType:
+          type: string
+          enum: [string, number]
+        name:
+          type: string
+        address:
+          oneOf:
+            - type: string
+            - type: integer
+        namespace:
+          type: integer
+        defaultValue:
+          nullable: true
+        accessMode:
+          type: string
+          enum: [r, rw]
+      required: [dataType, name, address, namespace, accessMode]
+    OpcUaDevice:
+      allOf:
+        - $ref: '#/components/schemas/DeviceMeta'
+        - type: object
+          properties:
+            collectorCycle:
+              type: integer
+            variableInterval:
+              type: integer
+            address:
+              $ref: '#/components/schemas/OpcAddress'
+            variables:
+              type: array
+              items:
+                $ref: '#/components/schemas/OpcUaVariable'
+          required: [collectorCycle, address, variables]
+    S7AddressOption:
+      type: object
+      properties:
+        port:
+          type: integer
+        rack:
+          type: integer
+        slot:
+          type: integer
+    S7Address:
+      type: object
+      properties:
+        location:
+          type: string
+        option:
+          $ref: '#/components/schemas/S7AddressOption'
+    S7Variable:
+      type: object
+      properties:
+        dataType:
+          type: string
+          enum: [bool, int16, float32, float64, int32, int64, uint16]
+        name:
+          type: string
+        address:
+          type: string
+        rate:
+          type: number
+        defaultValue:
+          nullable: true
+        accessMode:
+          type: string
+          enum: [r, rw]
+      required: [dataType, name, address, accessMode]
+    S7Device:
+      allOf:
+        - $ref: '#/components/schemas/DeviceMeta'
+        - type: object
+          properties:
+            collectorCycle:
+              type: integer
+            variableInterval:
+              type: integer
+            address:
+              $ref: '#/components/schemas/S7Address'
+            variables:
+              type: array
+              items:
+                $ref: '#/components/schemas/S7Variable'
+          required: [collectorCycle, address, variables]
+    DeviceUnion:
+      oneOf:
+        - $ref: '#/components/schemas/ModbusDevice'
+        - $ref: '#/components/schemas/OpcUaDevice'
+        - $ref: '#/components/schemas/S7Device'
+      discriminator:
+        propertyName: deviceType
+        mapping:
+          modbus: '#/components/schemas/ModbusDevice'
+          opcUa: '#/components/schemas/OpcUaDevice'
+          s7: '#/components/schemas/S7Device'
+    DeviceResource:
+      oneOf:
+        - $ref: '#/components/schemas/DeviceMeta'
+        - $ref: '#/components/schemas/ModbusDevice'
+        - $ref: '#/components/schemas/OpcUaDevice'
+        - $ref: '#/components/schemas/S7Device'
+    DeviceListResponse:
+      type: object
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceResource'
+      required: [devices]
+    ActionCommandList:
+      type: array
+      description: >-
+        Array of maps; each key must match a writable variable name. Use one map
+        entry per variable to avoid duplicate-key validation errors.
+      items:
+        type: object
+        additionalProperties: {}
+    JsonPatchOperation:
+      type: object
+      properties:
+        op:
+          type: string
+          enum: [add, remove, replace, move, copy, test]
+        path:
+          type: string
+        value:
+          nullable: true
+        from:
+          type: string
+      required: [op, path]
+    GatewayMeta:
+      type: object
+      properties:
+        secret:
+          type: string
+        name:
+          type: string
+        id:
+          type: string
+        eTag:
+          type: string
+        modTime:
+          type: string
+          format: date-time
+    GatewayCpuResponse:
+      type: object
+      properties:
+        cpus:
+          type: object
+          additionalProperties:
+            type: string
+    GatewayMemResponse:
+      type: object
+      properties:
+        mem:
+          type: object
+          properties:
+            total:
+              type: string
+            used:
+              type: string
+            usedPercent:
+              type: string
+    GatewayDiskResponse:
+      type: object
+      properties:
+        disk:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              total:
+                type: string
+              used:
+                type: string
+              usedPercent:
+                type: string
+    TagNamesResponse:
+      type: object
+      properties:
+        tagNames:
+          type: array
+          items:
+            type: string
+      required: [tagNames]
