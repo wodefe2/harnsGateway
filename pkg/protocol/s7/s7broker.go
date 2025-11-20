@@ -13,6 +13,7 @@ import (
 	"k8s.io/klog/v2"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -262,7 +263,7 @@ func (broker *S7Broker) Destroy(ctx context.Context) {
 func (broker *S7Broker) Collect(ctx context.Context) {
 	go func() {
 		for {
-			start := time.Now().Unix()
+			cycleStart := time.Now()
 			if !broker.poll(ctx) {
 				return
 			}
@@ -270,11 +271,18 @@ func (broker *S7Broker) Collect(ctx context.Context) {
 			case <-broker.ExitCh:
 				return
 			default:
-				end := time.Now().Unix()
-				elapsed := end - start
-				if elapsed < int64(broker.Device.CollectorCycle) {
-					time.Sleep(time.Duration(int64(broker.Device.CollectorCycle)) * time.Second)
+				target := time.Duration(broker.Device.CollectorCycle) * time.Second
+				cycleDuration := time.Since(cycleStart)
+				if target <= 0 {
+					klog.V(4).InfoS("S7 poll cycle completed", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds())
+					continue
 				}
+				if cycleDuration > target {
+					klog.V(3).InfoS("S7 poll exceeded cycle budget", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds(), "cycleSeconds", broker.Device.CollectorCycle)
+					continue
+				}
+				klog.V(4).InfoS("S7 poll cycle completed", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds())
+				time.Sleep(target - cycleDuration)
 			}
 		}
 	}()
@@ -416,6 +424,11 @@ func (broker *S7Broker) poll(ctx context.Context) bool {
 	default:
 		sw := &sync.WaitGroup{}
 		dfvCh := make(chan *s7runtime.ParseVariableResult, 0)
+		frameCount := 0
+		for _, dataFrames := range broker.StoreAddressDataFrameMap {
+			frameCount += len(dataFrames)
+		}
+		klog.V(4).InfoS("S7 poll started", "deviceId", broker.Device.ID, "frames", frameCount)
 		for _, dataFrames := range broker.StoreAddressDataFrameMap {
 			for _, frame := range dataFrames {
 				sw.Add(1)
@@ -425,6 +438,7 @@ func (broker *S7Broker) poll(ctx context.Context) bool {
 		go broker.rollVariable(ctx, dfvCh)
 		sw.Wait()
 		close(dfvCh)
+		klog.V(4).InfoS("S7 poll finished", "deviceId", broker.Device.ID, "frames", frameCount)
 		return true
 	}
 }
@@ -432,19 +446,20 @@ func (broker *S7Broker) message(ctx context.Context, dataFrame *S7DataFrame, pvr
 	defer sw.Done()
 	defer func() {
 		if err := recover(); err != nil {
-			klog.V(2).InfoS("Failed to ask s7 message", "error", err)
+			klog.V(2).InfoS("Failed to ask s7 message", "error", err, "deviceId", broker.Device.ID)
 		}
 	}()
 	messenger, err := clients.GetMessenger(ctx)
 	defer clients.ReleaseMessenger(messenger)
 	if err != nil {
-		klog.V(2).InfoS("Failed to get tunnel", "error", err)
+		klog.V(2).InfoS("Failed to get S7 messenger", "error", err, "deviceId", broker.Device.ID)
 		if messenger, err = broker.Clients.NewMessenger(); err != nil {
 			return
 		}
 	}
 
 	var buf []byte
+	klog.V(4).InfoS("S7 frame request", "deviceId", broker.Device.ID, "zone", s7runtime.StoreAddressToString[dataFrame.Zone], "items", len(dataFrame.Variables))
 	if err := broker.retry(func(messenger s7runtime.Messenger, dataFrame *S7DataFrame) error {
 		least, err := messenger.AskAtLeast(dataFrame.DataFrame, dataFrame.ResponseDataFrame, 19)
 		if err != nil {
@@ -456,7 +471,7 @@ func (broker *S7Broker) message(ctx context.Context, dataFrame *S7DataFrame, pvr
 		}
 		return nil
 	}, messenger, dataFrame); err != nil {
-		klog.V(2).InfoS("Failed to connect s7 server by retry three times")
+		klog.V(2).InfoS("Failed to connect s7 server by retry", "deviceId", broker.Device.ID, "zone", s7runtime.StoreAddressToString[dataFrame.Zone], "error", err)
 		pvrCh <- &s7runtime.ParseVariableResult{Err: []error{err}}
 		return
 	}
@@ -467,7 +482,11 @@ func (broker *S7Broker) message(ctx context.Context, dataFrame *S7DataFrame, pvr
 func (broker *S7Broker) retry(fun func(messenger s7runtime.Messenger, dataFrame *S7DataFrame) error, messenger s7runtime.Messenger, dataFrame *S7DataFrame) error {
 	for i := 0; i < 3; i++ {
 		err := fun(messenger, dataFrame)
+		attempt := i + 1
 		if err == nil {
+			if attempt > 1 {
+				klog.V(4).InfoS("S7 frame recovered after retry", "deviceId", broker.Device.ID, "attempt", attempt)
+			}
 			return nil
 		} else if errors.Is(err, s7runtime.ErrBadConn) {
 			messenger.Close()
@@ -476,11 +495,13 @@ func (broker *S7Broker) retry(fun func(messenger s7runtime.Messenger, dataFrame 
 				return err
 			}
 			messenger.Reset(newMessenger)
+			klog.V(3).InfoS("S7 messenger recreated", "deviceId", broker.Device.ID, "attempt", attempt)
 			i = i - 1
 		} else {
-			klog.V(2).InfoS("Failed to connect s7 server", "error", err)
+			klog.V(2).InfoS("Failed to connect s7 server", "deviceId", broker.Device.ID, "attempt", attempt, "error", err)
 		}
 	}
+	klog.V(2).InfoS("S7 frame exhausted retries", "deviceId", broker.Device.ID)
 	return s7runtime.ErrManyRetry
 }
 
@@ -491,10 +512,14 @@ func (broker *S7Broker) rollVariable(ctx context.Context, ch chan *s7runtime.Par
 		select {
 		case pvr, ok := <-ch:
 			if !ok {
+				if len(errs) > 0 {
+					klog.V(2).InfoS("S7 poll completed with errors", "deviceId", broker.Device.ID, "errorCount", len(errs), "sample", summarizeErrors(errs, 3))
+				}
 				broker.VariableCh <- &runtime.ParseVariableResult{Err: errs, VariableSlice: rvs}
 				return
 			} else if pvr.Err != nil {
 				errs = append(errs, pvr.Err...)
+				klog.V(3).InfoS("S7 frame returned errors", "deviceId", broker.Device.ID, "errorCount", len(pvr.Err), "sample", summarizeErrors(pvr.Err, 2))
 			} else {
 				for _, variable := range pvr.VariableSlice {
 					rvs = append(rvs, variable)
@@ -660,4 +685,21 @@ func newS7COMMWriteDataItem(transportSize uint8, length uint16, data []byte) []b
 	itemBytes = append(itemBytes, binutil.Uint16ToBytesBigEndian(length)...)
 	itemBytes = append(itemBytes, data...)
 	return itemBytes
+}
+
+func summarizeErrors(errs []error, limit int) string {
+	if len(errs) == 0 || limit <= 0 {
+		return ""
+	}
+	msgs := make([]string, 0, limit)
+	for i, err := range errs {
+		if i >= limit {
+			break
+		}
+		msgs = append(msgs, err.Error())
+	}
+	if len(errs) > limit {
+		return fmt.Sprintf("%s (and %d more)", strings.Join(msgs, "; "), len(errs)-limit)
+	}
+	return strings.Join(msgs, "; ")
 }

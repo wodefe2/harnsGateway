@@ -77,6 +77,7 @@ func (m *Manager) Init() {
 			if errors.Is(err, constant.ErrConnectDevice) {
 				// 开启探测协程 15S一次
 				m.heartBeatDevices.Store(obj.GetID(), obj)
+				klog.V(3).InfoS("Device scheduled for heartbeat detection", "deviceId", obj.GetID(), "reason", "initialization connect failure")
 			} else {
 				klog.V(2).InfoS("Failed to start process collect device data", "deviceId", obj.GetID())
 			}
@@ -107,6 +108,7 @@ func (m *Manager) CreateDevice(object v1.DeviceType) (runtime.Device, error) {
 		if errors.Is(err, constant.ErrConnectDevice) {
 			// 开启探测协程 15S一次
 			m.heartBeatDevices.Store(rd.GetID(), rd)
+			klog.V(3).InfoS("Device scheduled for heartbeat detection", "deviceId", rd.GetID(), "reason", "create connect failure")
 		} else {
 			klog.V(2).InfoS("Failed to start process collect device data", "deviceId", rd.GetID())
 			return nil, err
@@ -354,16 +356,19 @@ func (m *Manager) readyCollect(obj runtime.Device) error {
 		switch {
 		case errors.Is(err, constant.ErrConnectDevice):
 			obj.SetCollectStatus(runtime.CollectStatusToString[runtime.Unconnected])
+			klog.ErrorS(err, "Failed to connect device for data collection", "deviceId", obj.GetID(), "deviceType", obj.GetDeviceType())
 			return err
 		case errors.Is(err, constant.ErrDeviceEmptyVariable):
 			obj.SetCollectStatus(runtime.CollectStatusToString[runtime.EmptyVariable])
+			klog.V(3).InfoS("Skip collecting device because variables are empty", "deviceId", obj.GetID(), "deviceType", obj.GetDeviceType())
 			return nil
 		default:
+			klog.ErrorS(err, "Failed to initialize device broker", "deviceId", obj.GetID(), "deviceType", obj.GetDeviceType())
 			return err
 		}
 	}
 	obj.SetCollectStatus(runtime.CollectStatusToString[runtime.Collecting])
-	klog.V(2).InfoS("Succeed to collect data", "deviceId", obj.GetID())
+	klog.V(2).InfoS("Succeed to initialize broker", "deviceId", obj.GetID(), "deviceType", obj.GetDeviceType())
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.brokers[obj.GetID()] = broker
@@ -414,6 +419,8 @@ func (m *Manager) readyCollect(obj runtime.Device) error {
 							// }
 						} else {
 							v.(runtime.Device).SetCollectStatus(runtime.CollectStatusToString[runtime.CollectingError])
+							sample := summarizeErrors(pvr.Err, 3)
+							klog.V(2).InfoS("Device broker returned errors", "deviceId", deviceId, "errorCount", len(pvr.Err), "sample", sample)
 						}
 					} else {
 						klog.V(2).InfoS("Failed to load device", "deviceId", deviceId)
@@ -481,6 +488,7 @@ func (m *Manager) heartBeatDetection() {
 				d := value.(runtime.Device)
 				if err := m.readyCollect(d); err == nil {
 					resumeDevices = append(resumeDevices, key.(string))
+					klog.V(2).InfoS("Device recovered via heartbeat", "deviceId", d.GetID())
 					return true
 				}
 				return false
@@ -519,6 +527,7 @@ func (m *Manager) listeningDeviceStatusCh() {
 
 func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 	cs := device.GetCollectStatus()
+	klog.V(2).InfoS("Device status switch requested", "deviceId", device.GetID(), "currentStatus", cs, "action", status)
 	switch runtime.StringToCollectStatus[cs] {
 	case runtime.Collecting:
 		switch runtime.StringToDeviceStatusCh[status] {
@@ -529,6 +538,7 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			if err := m.readyCollect(device); err != nil {
 				if errors.Is(err, constant.ErrConnectDevice) {
 					m.heartBeatDevices.Store(device.GetID(), device)
+					klog.V(3).InfoS("Device scheduled for heartbeat detection", "deviceId", device.GetID(), "reason", "restart connect failure")
 				} else {
 					klog.V(2).InfoS("Failed to start process collect device data", "deviceId", device.GetID())
 				}
@@ -536,6 +546,7 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			return
 		case runtime.Stop:
 			_ = m.cancelCollect(device)
+			klog.V(2).InfoS("Device collecting cancelled", "deviceId", device.GetID(), "action", "stop")
 			return
 		}
 	case runtime.CollectingError, runtime.Error:
@@ -545,6 +556,7 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			if err := m.readyCollect(device); err != nil {
 				if errors.Is(err, constant.ErrConnectDevice) {
 					m.heartBeatDevices.Store(device.GetID(), device)
+					klog.V(3).InfoS("Device scheduled for heartbeat detection", "deviceId", device.GetID(), "reason", "error recovery connect failure")
 				} else {
 					klog.V(2).InfoS("Failed to start process collect device data", "deviceId", device.GetID())
 				}
@@ -552,6 +564,7 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			return
 		case runtime.Stop:
 			_ = m.cancelCollect(device)
+			klog.V(2).InfoS("Device collecting cancelled", "deviceId", device.GetID(), "action", "stop")
 			return
 		}
 	case runtime.EmptyVariable, runtime.Unconnected:
@@ -561,6 +574,7 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			if err := m.readyCollect(device); err != nil {
 				if errors.Is(err, constant.ErrConnectDevice) {
 					m.heartBeatDevices.Store(device.GetID(), device)
+					klog.V(3).InfoS("Device scheduled for heartbeat detection", "deviceId", device.GetID(), "reason", "unconnected recovery")
 				} else {
 					klog.V(2).InfoS("Failed to start process collect device data", "deviceId", device.GetID())
 				}
@@ -568,6 +582,7 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			return
 		case runtime.Stop:
 			_ = m.cancelCollect(device)
+			klog.V(2).InfoS("Device collecting cancelled", "deviceId", device.GetID(), "action", "stop")
 			return
 		}
 	case runtime.Stopped:
@@ -576,12 +591,14 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 			if err := m.readyCollect(device); err != nil {
 				if errors.Is(err, constant.ErrConnectDevice) {
 					m.heartBeatDevices.Store(device.GetID(), device)
+					klog.V(3).InfoS("Device scheduled for heartbeat detection", "deviceId", device.GetID(), "reason", "start connect failure")
 				} else {
 					klog.V(2).InfoS("Failed to start process collect device data", "deviceId", device.GetID())
 				}
 			}
 			return
 		case runtime.Stop:
+			klog.V(3).InfoS("Received redundant stop for device", "deviceId", device.GetID())
 			return
 		}
 	}
@@ -591,6 +608,7 @@ func (m *Manager) processData(pds []runtime.PointData) {
 	start := time.Now()
 
 	thingTimeSeries := make(map[string]map[string]interface{}, 0)
+	failedWrites := 0
 
 	for _, pd := range pds {
 		deviceProperty := strings.Split(pd.DataPointId, m.placeholder)
@@ -608,11 +626,12 @@ func (m *Manager) processData(pds []runtime.PointData) {
 
 		set := m.redisClient.HSet(context.Background(), thingCode, kv)
 		if set.Err() != nil {
+			failedWrites++
 			klog.V(2).InfoS("Failed save data to redis", "thingCode", thingCode, "err", set.Err())
 		}
 	}
 	end := time.Now()
-	klog.V(5).InfoS("Insert into redis", "time", end.Sub(start).Seconds())
+	klog.V(3).InfoS("Sync collected data to redis", "deviceBuckets", len(thingTimeSeries), "points", len(pds), "failed", failedWrites, "durationSeconds", end.Sub(start).Seconds())
 }
 
 func (m *Manager) Daemon() {
@@ -679,12 +698,30 @@ func (m *Manager) Daemon() {
 
 func (m *Manager) insertIntoInfluxdb(measurement string, thingTimeSeries map[string]map[string]interface{}, points []*write.Point, t time.Time) {
 	start := time.Now()
+	initialLen := len(points)
 	for thingCode, kv := range thingTimeSeries {
 		point := write.NewPoint(measurement, map[string]string{"ti": thingCode}, kv, t)
 		points = append(points, point)
 	}
-	klog.V(3).InfoS("Insert into influxdb", "points", points)
 	m.tsManager.SaveOrUpdateTimeSeries(points)
 	end := time.Now()
-	klog.V(5).InfoS("Insert into influxdb", "time", end.Sub(start).Seconds())
+	written := len(points) - initialLen
+	klog.V(3).InfoS("Insert into influxdb", "measurement", measurement, "thingCodes", len(thingTimeSeries), "points", written, "durationSeconds", end.Sub(start).Seconds())
+}
+
+func summarizeErrors(errs []error, limit int) string {
+	if len(errs) == 0 || limit <= 0 {
+		return ""
+	}
+	msgs := make([]string, 0, limit)
+	for i, err := range errs {
+		if i >= limit {
+			break
+		}
+		msgs = append(msgs, err.Error())
+	}
+	if len(errs) > limit {
+		return fmt.Sprintf("%s (and %d more)", strings.Join(msgs, "; "), len(errs)-limit)
+	}
+	return strings.Join(msgs, "; ")
 }

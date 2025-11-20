@@ -3,6 +3,7 @@ package opcua
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/gopcua/opcua/ua"
 	genericruntime "harnsgateway/pkg/generic/runtime"
 	"harnsgateway/pkg/protocol/opcua/model"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"k8s.io/klog/v2"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,7 +104,7 @@ func (broker *OpcUaBroker) Destroy(ctx context.Context) {
 func (broker *OpcUaBroker) Collect(ctx context.Context) {
 	go func() {
 		for {
-			start := time.Now().Unix()
+			cycleStart := time.Now()
 			if !broker.poll(ctx) {
 				return
 			}
@@ -110,11 +112,18 @@ func (broker *OpcUaBroker) Collect(ctx context.Context) {
 			case <-broker.ExitCh:
 				return
 			default:
-				end := time.Now().Unix()
-				elapsed := end - start
-				if elapsed < int64(broker.Device.CollectorCycle) {
-					time.Sleep(time.Duration(int64(broker.Device.CollectorCycle)) * time.Second)
+				target := time.Duration(broker.Device.CollectorCycle) * time.Second
+				cycleDuration := time.Since(cycleStart)
+				if target <= 0 {
+					klog.V(4).InfoS("OPC UA poll cycle completed", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds())
+					continue
 				}
+				if cycleDuration > target {
+					klog.V(3).InfoS("OPC UA poll exceeded cycle budget", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds(), "cycleSeconds", broker.Device.CollectorCycle)
+					continue
+				}
+				klog.V(4).InfoS("OPC UA poll cycle completed", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds())
+				time.Sleep(target - cycleDuration)
 			}
 		}
 	}()
@@ -132,6 +141,8 @@ func (broker *OpcUaBroker) poll(ctx context.Context) bool {
 	default:
 		sw := &sync.WaitGroup{}
 		dfvCh := make(chan *opcuaruntime.ParseVariableResult, 0)
+		frameCount := len(broker.NamespaceVariableDataFrame)
+		klog.V(4).InfoS("OPC UA poll started", "deviceId", broker.Device.ID, "frames", frameCount)
 		for _, dataFrames := range broker.NamespaceVariableDataFrame {
 			sw.Add(1)
 			go broker.message(ctx, dataFrames, dfvCh, sw)
@@ -139,6 +150,7 @@ func (broker *OpcUaBroker) poll(ctx context.Context) bool {
 		go broker.rollVariable(ctx, dfvCh)
 		sw.Wait()
 		close(dfvCh)
+		klog.V(4).InfoS("OPC UA poll finished", "deviceId", broker.Device.ID, "frames", frameCount)
 		return true
 	}
 
@@ -148,22 +160,24 @@ func (broker *OpcUaBroker) message(ctx context.Context, dataFrame *OpuUaDataFram
 	defer sw.Done()
 	messenger, err := broker.Clients.GetMessenger(ctx)
 	if err != nil {
+		klog.V(2).InfoS("Failed to get OPC UA messenger", "deviceId", broker.Device.ID, "error", err)
 		pvrCh <- &opcuaruntime.ParseVariableResult{Err: []error{err}}
 	}
 	defer broker.Clients.ReleaseMessenger(messenger)
 
 	var response *ua.ReadResponse
+	klog.V(4).InfoS("OPC UA frame request", "deviceId", broker.Device.ID, "variables", len(dataFrame.Variables))
 	if err := broker.retry(func(messenger opcuaruntime.Messenger, dataFrame *OpuUaDataFrame) error {
 		response, err = messenger.Read(ctx, dataFrame.RequestVariables)
 		return err
 	}, messenger, dataFrame); err != nil {
-		klog.V(2).InfoS("Failed to connect opc ua server by retry three times")
+		klog.V(2).InfoS("Failed to connect opc ua server by retry", "deviceId", broker.Device.ID, "error", err)
 		pvrCh <- &opcuaruntime.ParseVariableResult{Err: []error{err}}
 		return
 	}
 
 	if response == nil {
-		klog.V(2).InfoS("Failed to get opc ua server response")
+		klog.V(2).InfoS("Failed to get opc ua server response", "deviceId", broker.Device.ID)
 		return
 	}
 
@@ -179,6 +193,8 @@ func (broker *OpcUaBroker) message(ctx context.Context, dataFrame *OpuUaDataFram
 				DefaultValue: variable.DefaultValue,
 				Value:        variable.Value,
 			})
+		} else {
+			klog.V(3).InfoS("OPC UA node returned bad status", "deviceId", broker.Device.ID, "namespace", variable.Namespace, "node", variable.Address, "status", response.Results[i].Status.Error())
 		}
 	}
 
@@ -188,7 +204,11 @@ func (broker *OpcUaBroker) message(ctx context.Context, dataFrame *OpuUaDataFram
 func (broker *OpcUaBroker) retry(fun func(m opcuaruntime.Messenger, dataFrame *OpuUaDataFrame) error, m opcuaruntime.Messenger, dataFrame *OpuUaDataFrame) error {
 	for i := 0; i < 3; i++ {
 		err := fun(m, dataFrame)
+		attempt := i + 1
 		if err == nil {
+			if attempt > 1 {
+				klog.V(4).InfoS("OPC UA frame recovered after retry", "deviceId", broker.Device.ID, "attempt", attempt)
+			}
 			return nil
 		}
 		switch {
@@ -198,6 +218,7 @@ func (broker *OpcUaBroker) retry(fun func(m opcuaruntime.Messenger, dataFrame *O
 				return err
 			}
 			m.Reset(newMessenger)
+			klog.V(3).InfoS("OPC UA messenger recreated", "deviceId", broker.Device.ID, "attempt", attempt, "reason", "eof")
 			i = i - 1
 			continue
 		case errors.Is(err, ua.StatusBadSessionIDInvalid):
@@ -206,6 +227,7 @@ func (broker *OpcUaBroker) retry(fun func(m opcuaruntime.Messenger, dataFrame *O
 				return err
 			}
 			m.Reset(newMessenger)
+			klog.V(3).InfoS("OPC UA messenger recreated", "deviceId", broker.Device.ID, "attempt", attempt, "reason", "sessionInvalid")
 			i = i - 1
 			continue
 		case errors.Is(err, ua.StatusBadSessionNotActivated):
@@ -214,6 +236,7 @@ func (broker *OpcUaBroker) retry(fun func(m opcuaruntime.Messenger, dataFrame *O
 				return err
 			}
 			m.Reset(newMessenger)
+			klog.V(3).InfoS("OPC UA messenger recreated", "deviceId", broker.Device.ID, "attempt", attempt, "reason", "sessionNotActivated")
 			i = i - 1
 			continue
 		case errors.Is(err, ua.StatusBadServerNotConnected):
@@ -222,14 +245,17 @@ func (broker *OpcUaBroker) retry(fun func(m opcuaruntime.Messenger, dataFrame *O
 				return err
 			}
 			m.Reset(newMessenger)
+			klog.V(3).InfoS("OPC UA messenger recreated", "deviceId", broker.Device.ID, "attempt", attempt, "reason", "serverNotConnected")
 			i = i - 1
 			continue
 		case errors.Is(err, ua.StatusBadSecureChannelIDInvalid):
+			klog.V(3).InfoS("OPC UA secure channel invalid", "deviceId", broker.Device.ID, "attempt", attempt)
 			continue
 		default:
-			klog.V(2).InfoS("Failed to read opc ua server data", "err", err)
+			klog.V(2).InfoS("Failed to read opc ua server data", "deviceId", broker.Device.ID, "attempt", attempt, "err", err)
 		}
 	}
+	klog.V(2).InfoS("OPC UA frame exhausted retries", "deviceId", broker.Device.ID)
 	return opcuaruntime.ErrManyRetry
 }
 
@@ -240,10 +266,14 @@ func (broker *OpcUaBroker) rollVariable(ctx context.Context, ch chan *opcuarunti
 		select {
 		case pvr, ok := <-ch:
 			if !ok {
+				if len(errs) > 0 {
+					klog.V(2).InfoS("OPC UA poll completed with errors", "deviceId", broker.Device.ID, "errorCount", len(errs), "sample", summarizeErrors(errs, 3))
+				}
 				broker.VariableCh <- &runtime.ParseVariableResult{Err: errs, VariableSlice: rvs}
 				return
 			} else if pvr.Err != nil {
 				errs = append(errs, pvr.Err...)
+				klog.V(3).InfoS("OPC UA frame returned errors", "deviceId", broker.Device.ID, "errorCount", len(pvr.Err), "sample", summarizeErrors(pvr.Err, 2))
 			} else {
 				for _, variable := range pvr.VariableSlice {
 					rvs = append(rvs, variable)
@@ -251,4 +281,21 @@ func (broker *OpcUaBroker) rollVariable(ctx context.Context, ch chan *opcuarunti
 			}
 		}
 	}
+}
+
+func summarizeErrors(errs []error, limit int) string {
+	if len(errs) == 0 || limit <= 0 {
+		return ""
+	}
+	msgs := make([]string, 0, limit)
+	for i, err := range errs {
+		if i >= limit {
+			break
+		}
+		msgs = append(msgs, err.Error())
+	}
+	if len(errs) > limit {
+		return fmt.Sprintf("%s (and %d more)", strings.Join(msgs, "; "), len(errs)-limit)
+	}
+	return strings.Join(msgs, "; ")
 }

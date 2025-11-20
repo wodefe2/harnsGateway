@@ -26,3 +26,9 @@ go.work
 
 _output/*
 serena.log
+lessons/lesson1/main.go
+lessons/lesson2/main.go
+lessons/lesson3/main.go
+lessons/lesson4/main.go
+lessons/lesson5/main.go
+lessons/lesson6/main.go

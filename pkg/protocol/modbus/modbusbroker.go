@@ -3,6 +3,7 @@ package modbus
 import (
 	"context"
 	"errors"
+	"fmt"
 	"harnsgateway/pkg/apis/response"
 	"harnsgateway/pkg/protocol/modbus/model"
 	modbus "harnsgateway/pkg/protocol/modbus/runtime"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/klog/v2"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -163,7 +165,7 @@ func (broker *ModbusBroker) Destroy(ctx context.Context) {
 func (broker *ModbusBroker) Collect(ctx context.Context) {
 	go func() {
 		for {
-			start := time.Now().Unix()
+			cycleStart := time.Now()
 			if !broker.poll(ctx) {
 				return
 			}
@@ -171,11 +173,18 @@ func (broker *ModbusBroker) Collect(ctx context.Context) {
 			case <-broker.ExitCh:
 				return
 			default:
-				end := time.Now().Unix()
-				elapsed := end - start
-				if elapsed < int64(broker.Device.CollectorCycle) {
-					time.Sleep(time.Duration(int64(broker.Device.CollectorCycle)) * time.Second)
+				target := time.Duration(broker.Device.CollectorCycle) * time.Second
+				cycleDuration := time.Since(cycleStart)
+				if target <= 0 {
+					klog.V(4).InfoS("Modbus poll cycle completed", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds())
+					continue
 				}
+				if cycleDuration > target {
+					klog.V(3).InfoS("Modbus poll exceeded cycle budget", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds(), "cycleSeconds", broker.Device.CollectorCycle)
+					continue
+				}
+				klog.V(4).InfoS("Modbus poll cycle completed", "deviceId", broker.Device.ID, "durationSeconds", cycleDuration.Seconds())
+				time.Sleep(target - cycleDuration)
 			}
 		}
 	}()
@@ -337,6 +346,11 @@ func (broker *ModbusBroker) poll(ctx context.Context) bool {
 	default:
 		sw := &sync.WaitGroup{}
 		dfvCh := make(chan *modbus.ParseVariableResult, 0)
+		frameCount := 0
+		for _, DataFrames := range broker.FunctionCodeDataFrameMap {
+			frameCount += len(DataFrames)
+		}
+		klog.V(4).InfoS("Modbus poll started", "deviceId", broker.Device.ID, "frames", frameCount)
 		for _, DataFrames := range broker.FunctionCodeDataFrameMap {
 			for _, frame := range DataFrames {
 				sw.Add(1)
@@ -346,6 +360,7 @@ func (broker *ModbusBroker) poll(ctx context.Context) bool {
 		go broker.rollVariable(ctx, dfvCh)
 		sw.Wait()
 		close(dfvCh)
+		klog.V(4).InfoS("Modbus poll finished", "deviceId", broker.Device.ID, "frames", frameCount)
 		return true
 	}
 }
@@ -354,7 +369,7 @@ func (broker *ModbusBroker) message(ctx context.Context, dataFrame *modbus.ModBu
 	defer sw.Done()
 	defer func() {
 		if err := recover(); err != nil {
-			klog.V(2).InfoS("Failed to ask Modbus server message", "error", err)
+			klog.V(2).InfoS("Failed to ask Modbus server message", "error", err, "deviceId", broker.Device.ID)
 		}
 	}()
 	messenger, err := clients.GetMessenger(ctx)
@@ -367,6 +382,7 @@ func (broker *ModbusBroker) message(ctx context.Context, dataFrame *modbus.ModBu
 	}
 
 	var buf []byte
+	klog.V(4).InfoS("Modbus frame request", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "startAddress", dataFrame.StartAddress, "maxDataSize", dataFrame.MaxDataSize)
 
 	if err := broker.retry(func(messenger modbus.Messenger, dataFrame *modbus.ModBusDataFrame) error {
 		if broker.NeedCheckTransaction {
@@ -382,7 +398,7 @@ func (broker *ModbusBroker) message(ctx context.Context, dataFrame *modbus.ModBu
 		}
 		return nil
 	}, messenger, dataFrame); err != nil {
-		klog.V(2).InfoS("Failed to connect modbus server", "error", err)
+		klog.V(2).InfoS("Failed to collect modbus frame", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "startAddress", dataFrame.StartAddress, "error", err)
 		pvrCh <- &modbus.ParseVariableResult{Err: []error{err}}
 		return
 	}
@@ -394,6 +410,9 @@ func (broker *ModbusBroker) retry(fun func(messenger modbus.Messenger, dataFrame
 	for i := 0; i < 3; i++ {
 		err := fun(messenger, dataFrame)
 		if err == nil {
+			if i > 0 {
+				klog.V(4).InfoS("Modbus frame recovered after retry", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1)
+			}
 			return nil
 		} else if errors.Is(err, modbus.ErrModbusBadConn) {
 			messenger.Close()
@@ -402,10 +421,12 @@ func (broker *ModbusBroker) retry(fun func(messenger modbus.Messenger, dataFrame
 				return err
 			}
 			messenger.Reset(newMessenger)
+			klog.V(3).InfoS("Modbus messenger recreated", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1)
 		} else {
-			klog.V(2).InfoS("Failed to connect Modbus server", "error", err)
+			klog.V(2).InfoS("Modbus frame attempt failed", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1, "error", err)
 		}
 	}
+	klog.V(2).InfoS("Modbus frame exhausted retries", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode)
 	return modbus.ErrManyRetry
 }
 
@@ -474,10 +495,14 @@ func (broker *ModbusBroker) rollVariable(ctx context.Context, ch chan *modbus.Pa
 		select {
 		case pvr, ok := <-ch:
 			if !ok {
+				if len(errs) > 0 {
+					klog.V(2).InfoS("Modbus poll completed with errors", "deviceId", broker.Device.ID, "errorCount", len(errs), "sample", summarizeErrors(errs, 3))
+				}
 				broker.VariableCh <- &runtime.ParseVariableResult{Err: errs, VariableSlice: rvs}
 				return
 			} else if pvr.Err != nil {
 				errs = append(errs, pvr.Err...)
+				klog.V(3).InfoS("Modbus frame returned errors", "deviceId", broker.Device.ID, "errorCount", len(pvr.Err), "sample", summarizeErrors(pvr.Err, 2))
 			} else {
 				for _, variable := range pvr.VariableSlice {
 					rvs = append(rvs, variable)
@@ -485,6 +510,23 @@ func (broker *ModbusBroker) rollVariable(ctx context.Context, ch chan *modbus.Pa
 			}
 		}
 	}
+}
+
+func summarizeErrors(errs []error, limit int) string {
+	if len(errs) == 0 || limit <= 0 {
+		return ""
+	}
+	msgs := make([]string, 0, limit)
+	for i, err := range errs {
+		if i >= limit {
+			break
+		}
+		msgs = append(msgs, err.Error())
+	}
+	if len(errs) > limit {
+		return fmt.Sprintf("%s (and %d more)", strings.Join(msgs, "; "), len(errs)-limit)
+	}
+	return strings.Join(msgs, "; ")
 }
 
 func (broker *ModbusBroker) generateActionBytes(memoryLayout constant.MemoryLayout, action []*modbus.Variable) [][]byte {

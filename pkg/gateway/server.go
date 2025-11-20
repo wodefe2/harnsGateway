@@ -16,7 +16,11 @@ func InstallHandler(group *gin.RouterGroup, mgr *Manager) {
 
 func getGatewayMeta(mgr *Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		g, _ := mgr.GetGatewayMeta()
+		g, err := mgr.GetGatewayMeta()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+			return
+		}
 		c.Header(apis.ETag, fmt.Sprintf("%s", g.GetVersion()))
 		c.JSON(http.StatusOK, g)
 	}
@@ -26,7 +30,7 @@ func getGatewayCpu(mgr *Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cpu, err := mgr.getGatewayCpu()
 		if err != nil {
-			c.Status(http.StatusInternalServerError)
+			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 			return
 		}
 		c.JSON(http.StatusOK, ResponseModel{Cpus: cpu})
@@ -37,7 +41,7 @@ func getGatewayMem(mgr *Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		mem, err := mgr.getGatewayMem()
 		if err != nil {
-			c.Status(http.StatusInternalServerError)
+			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 			return
 		}
 		c.JSON(http.StatusOK, ResponseModel{Mem: mem})
@@ -48,7 +52,7 @@ func getGatewayDisk(mgr *Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		disks, err := mgr.getGatewayDisk()
 		if err != nil {
-			c.Status(http.StatusInternalServerError)
+			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 			return
 		}
 		c.JSON(http.StatusOK, ResponseModel{Disks: disks})

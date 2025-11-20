@@ -3,21 +3,20 @@ package device
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	jsonpatch "github.com/evanphx/json-patch"
-	"github.com/gin-gonic/gin"
 	"harnsgateway/pkg/apis"
 	"harnsgateway/pkg/apis/response"
 	"harnsgateway/pkg/generic"
 	"harnsgateway/pkg/runtime"
 	"io"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog/v2"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
+
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/gin-gonic/gin"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
 
 func InstallHandler(group *gin.RouterGroup, mgr *Manager) {
@@ -33,12 +32,17 @@ func InstallHandler(group *gin.RouterGroup, mgr *Manager) {
 
 }
 
+func respondError(c *gin.Context, err error) {
+	c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+}
+
 func createDevice(mgr *Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		bodyBytes, err := io.ReadAll(c.Request.Body)
 		if err != nil {
 			klog.V(2).InfoS("Failed to get request body", "err", err)
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+			respondError(c, err)
+			return
 		}
 
 		var target struct {
@@ -47,20 +51,21 @@ func createDevice(mgr *Manager) gin.HandlerFunc {
 		err = json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(&target)
 		if err != nil {
 			klog.V(2).InfoS("Failed to parse device type", "err", err)
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrRequestBody))
+			respondError(c, err)
+			return
 		}
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 		object := generic.DeviceTypeMap[target.DeviceType]()
 		if err := c.ShouldBindJSON(object); err != nil {
 			klog.V(2).InfoS("Failed to parse Device", "err", err)
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+			respondError(c, err)
 			return
 		}
 		d, err := mgr.CreateDevice(object)
 
 		if err != nil {
-			c.JSON(http.StatusBadRequest, response.NewMultiError(err))
+			respondError(c, err)
 			return
 		}
 
@@ -81,13 +86,7 @@ func deleteDevice(mgr *Manager) gin.HandlerFunc {
 		}
 		device, err := mgr.DeleteDevice(id, eTag)
 		if err != nil {
-			if os.IsNotExist(err) {
-				c.Status(http.StatusNotFound)
-			} else if errors.Is(err, apis.ErrMismatch) {
-				c.Status(http.StatusPreconditionFailed)
-			} else {
-				c.JSON(http.StatusBadRequest, response.NewMultiError(err))
-			}
+			respondError(c, err)
 			return
 		}
 		c.JSON(http.StatusOK, device)
@@ -118,51 +117,40 @@ func patchDeviceById(mgr *Manager) gin.HandlerFunc {
 		pathBytes, err := io.ReadAll(c.Request.Body)
 		if err != nil {
 			klog.V(3).InfoS("Failed to read", "err", err)
-			c.Status(http.StatusInternalServerError)
+			respondError(c, err)
 			return
 		}
 
 		id := c.Param("id")
 		old, err := mgr.GetDeviceById(id, true)
 		if err != nil {
-			c.Status(http.StatusNotFound)
+			respondError(c, err)
 			return
 		}
 
 		versionedJS, err := json.Marshal(old)
 		if err != nil {
 			klog.V(3).InfoS("Failed to marshal", "err", err)
-			c.Status(http.StatusInternalServerError)
+			respondError(c, err)
 			return
 		}
 
 		patchedJS, err := applyJSPatch(types.PatchType(contentType), pathBytes, versionedJS)
 		if err != nil {
-			c.JSONP(http.StatusBadRequest, response.NewMultiError(err))
+			respondError(c, err)
 			return
 		}
 
 		newObj := generic.DeviceTypeMap[old.GetDeviceType()]()
 		if err := json.NewDecoder(bytes.NewBuffer(patchedJS)).Decode(newObj); err != nil {
 			klog.V(3).InfoS("Failed to decode", "err", err)
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+			respondError(c, err)
 			return
 		}
 
 		updated, err := mgr.UpdateDeviceById(id, eTag, newObj)
 		if err != nil {
-			switch {
-			case os.IsNotExist(err):
-				c.Status(http.StatusNotFound)
-			case errors.Is(err, apis.ErrMismatch):
-				c.Status(http.StatusPreconditionFailed)
-			default:
-				if response.IsResponseError(err) {
-					c.JSON(http.StatusBadRequest, response.NewMultiError(err))
-				} else {
-					c.Status(http.StatusInternalServerError)
-				}
-			}
+			respondError(c, err)
 			return
 		}
 
@@ -184,31 +172,20 @@ func updateDeviceById(mgr *Manager) gin.HandlerFunc {
 		id := c.Param("id")
 		old, err := mgr.GetDeviceById(id, true)
 		if err != nil {
-			c.Status(http.StatusNotFound)
+			respondError(c, err)
 			return
 		}
 
 		newObj := generic.DeviceTypeMap[old.GetDeviceType()]()
 		if err := json.NewDecoder(c.Request.Body).Decode(newObj); err != nil {
 			klog.V(3).InfoS("Failed to decode", "err", err)
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+			respondError(c, err)
 			return
 		}
 
 		updated, err := mgr.UpdateDeviceById(id, eTag, newObj)
 		if err != nil {
-			switch {
-			case os.IsNotExist(err):
-				c.Status(http.StatusNotFound)
-			case errors.Is(err, apis.ErrMismatch):
-				c.Status(http.StatusPreconditionFailed)
-			default:
-				if response.IsResponseError(err) {
-					c.JSON(http.StatusBadRequest, response.NewMultiError(err))
-				} else {
-					c.Status(http.StatusInternalServerError)
-				}
-			}
+			respondError(c, err)
 			return
 		}
 
@@ -230,7 +207,7 @@ func listDevices(mgr *Manager) gin.HandlerFunc {
 			v := query.Get(apis.Filter)
 			if len(v) > 0 {
 				if err := json.Unmarshal([]byte(v), &filter); err != nil {
-					c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+					respondError(c, err)
 					return
 				}
 			}
@@ -254,11 +231,7 @@ func getDeviceById(mgr *Manager) gin.HandlerFunc {
 		}
 		rd, err := mgr.GetDeviceById(id, exploded)
 		if err != nil {
-			if os.IsNotExist(err) {
-				c.Status(http.StatusNotFound)
-			} else {
-				c.Status(http.StatusInternalServerError)
-			}
+			respondError(c, err)
 			return
 		}
 
@@ -274,11 +247,8 @@ func switchDeviceStatusById(mgr *Manager) gin.HandlerFunc {
 		id := c.Param("id")
 		status := c.Param("status")
 		if err := mgr.SwitchDeviceStatus(id, status); err != nil {
-			if os.IsNotExist(err) {
-				c.Status(http.StatusNotFound)
-			} else {
-				c.JSON(http.StatusBadRequest, response.NewMultiError(err))
-			}
+			respondError(c, err)
+			return
 		}
 		c.Status(http.StatusAccepted)
 	}
@@ -292,14 +262,14 @@ func controlDeviceById(mgr *Manager) gin.HandlerFunc {
 		var actions []map[string]interface{}
 		if err := json.NewDecoder(c.Request.Body).Decode(&actions); err != nil {
 			klog.V(3).InfoS("Failed to parse action", "err", err)
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+			respondError(c, err)
 			return
 		}
 
 		err := mgr.DeliverAction(id, actions)
 
 		if err != nil {
-			c.JSON(http.StatusBadRequest, err)
+			respondError(c, err)
 			return
 		}
 
@@ -314,12 +284,13 @@ func uploadFile(mgr *Manager) gin.HandlerFunc {
 		id := c.Param("name")
 		file, err1 := c.FormFile("file")
 		if err1 != nil {
-			c.JSON(http.StatusBadRequest, response.NewMultiError(response.ErrMalformedJSON))
+			respondError(c, err1)
+			return
 		}
 		err := mgr.UpdateDeviceVariableByName(id, file)
 
 		if err != nil {
-			c.JSON(http.StatusBadRequest, err)
+			respondError(c, err)
 			return
 		}
 
