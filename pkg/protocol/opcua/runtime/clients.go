@@ -8,6 +8,7 @@ import (
 	"harnsgateway/pkg/runtime/constant"
 	"k8s.io/klog/v2"
 	"sync"
+	"time"
 )
 
 type Clients struct {
@@ -33,7 +34,13 @@ type UaClient struct {
 }
 
 func (u *UaClient) Read(ctx context.Context, req *ua.ReadRequest) (*ua.ReadResponse, error) {
-	return u.Client.Read(ctx, req)
+	readCtx := ctx
+	if u.Timeout > 0 {
+		var cancel context.CancelFunc
+		readCtx, cancel = context.WithTimeout(ctx, time.Duration(u.Timeout)*time.Second)
+		defer cancel()
+	}
+	return u.Client.Read(readCtx, req)
 }
 
 func (u *UaClient) Close(ctx context.Context) {

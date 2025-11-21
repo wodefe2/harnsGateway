@@ -9,6 +9,7 @@ import (
 	opc "harnsgateway/pkg/protocol/opcua/runtime"
 	"k8s.io/klog/v2"
 	"sync"
+	"time"
 )
 
 type OpcUa struct {
@@ -25,7 +26,9 @@ func (o *OpcUa) NewClients(address *opc.Address, dataFrameCount int) (*opc.Clien
 		endpoint = fmt.Sprintf("%s:%d", address.Location, address.Option.Port)
 	}
 	// var endpoints []*ua.EndpointDescription
-	endpoints, err := opcua.GetEndpoints(context.Background(), endpoint)
+	endpointsCtx, endpointsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer endpointsCancel()
+	endpoints, err := opcua.GetEndpoints(endpointsCtx, endpoint)
 	if err != nil {
 		klog.V(2).InfoS("Failed to connect opc ua server")
 		return nil, err
@@ -57,10 +60,13 @@ func (o *OpcUa) NewClients(address *opc.Address, dataFrameCount int) (*opc.Clien
 			klog.V(2).InfoS("Failed to get opc ua client")
 			return nil, err
 		}
-		if err = c.Connect(context.Background()); err != nil {
+		connectCtx, connectCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err = c.Connect(connectCtx); err != nil {
+			connectCancel()
 			klog.V(2).InfoS("Failed to connect opc ua server")
 			return nil, err
 		}
+		connectCancel()
 		m := &opc.UaClient{
 			Timeout: 1,
 			Client:  c,
@@ -81,9 +87,13 @@ func (o *OpcUa) NewClients(address *opc.Address, dataFrameCount int) (*opc.Clien
 			c, err = opcua.NewClient(endpoint, opcua.SecurityMode(ua.MessageSecurityModeNone))
 			if err != nil {
 				klog.V(2).InfoS("Failed to get opc ua client")
+				return nil, err
 			}
-			if err = c.Connect(context.Background()); err != nil {
+			connectCtx, connectCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer connectCancel()
+			if err = c.Connect(connectCtx); err != nil {
 				klog.V(2).InfoS("Failed to connect opc ua server")
+				return nil, err
 			}
 
 			return &opc.UaClient{

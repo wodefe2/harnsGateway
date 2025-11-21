@@ -84,6 +84,27 @@ func NewBroker(d runtime.Device) (runtime.Broker, chan *runtime.ParseVariableRes
 		klog.V(2).InfoS("Failed to connect OPC device", "error", err, "deviceId", device.ID)
 		return nil, nil, constant.ErrConnectDevice
 	}
+
+	// 设置 OPC UA 设备连接读超时时间为 3 秒
+	for e := clients.Messengers.Front(); e != nil; e = e.Next() {
+		if messenger, ok := e.Value.(opcuaruntime.Messenger); ok {
+			if c, ok := messenger.(*opcuaruntime.UaClient); ok {
+				c.Timeout = 3
+			}
+		}
+	}
+	originalNewMessenger := clients.NewMessenger
+	clients.NewMessenger = func() (opcuaruntime.Messenger, error) {
+		m, err := originalNewMessenger()
+		if err != nil {
+			return nil, err
+		}
+		if c, ok := m.(*opcuaruntime.UaClient); ok {
+			c.Timeout = 3
+		}
+		return m, nil
+	}
+
 	mtc := &OpcUaBroker{
 		Device:                     device,
 		ExitCh:                     make(chan struct{}, 0),
