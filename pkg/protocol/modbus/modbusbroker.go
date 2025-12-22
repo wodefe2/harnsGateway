@@ -680,7 +680,7 @@ func (broker *ModbusBroker) generateActionBytes(memoryLayout constant.MemoryLayo
 
 				var value float32
 				if variable.Rate != 0 && variable.Rate != 1 {
-					value = variable.Value.(float32) * float32(16000)
+					value = float32((variable.Value.(float64)) * variable.Rate)
 				} else {
 					value = variable.Value.(float32)
 				}

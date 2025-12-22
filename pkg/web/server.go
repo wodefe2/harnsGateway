@@ -4,17 +4,16 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/robfig/cron/v3"
 	"harnsgateway/cmd/gateway/config"
 	"harnsgateway/cmd/gateway/options"
 	"harnsgateway/pkg/device"
 	"harnsgateway/pkg/gateway"
 	"harnsgateway/pkg/generic"
-	"k8s.io/klog/v2"
 	"net/http"
-	"os"
-	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/robfig/cron/v3"
+	"k8s.io/klog/v2"
 )
 
 type Server struct {
@@ -93,15 +92,6 @@ func (s *Server) Daemon() (func(ctx context.Context), error) {
 
 	if _, err := cron.AddFunc("0/5 * * * *", func() {
 		s.Config.DeviceMgr.Daemon()
-	}); err != nil {
-		klog.V(2).InfoS("Failed insert into influxdb", "err", err)
-	}
-
-	if _, err := cron.AddFunc("0/4 * * * *", func() {
-		now := time.Now()
-		if now.After(time.Date(2025, 12, 1, 11, 20, 0, 0, time.Local)) {
-			os.Exit(1)
-		}
 	}); err != nil {
 		klog.V(2).InfoS("Failed insert into influxdb", "err", err)
 	}
