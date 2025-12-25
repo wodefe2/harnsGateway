@@ -15,7 +15,7 @@ type TsManager struct {
 
 func NewTsManager(influxdbUrl, influxdbToken string) *TsManager {
 	service := http.NewService(influxdbUrl, influxdbToken, http.DefaultOptions())
-	client := influxdb2.NewClientWithOptions(influxdbUrl, "c6jGYUCinwzeTWdeUh32", influxdb2.DefaultOptions().SetLogLevel(3))
+	client := influxdb2.NewClientWithOptions(influxdbUrl, influxdbToken, influxdb2.DefaultOptions().SetLogLevel(3))
 
 	s := &TsManager{
 		service: service,

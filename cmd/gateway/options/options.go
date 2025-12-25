@@ -10,6 +10,7 @@ import (
 	"harnsgateway/pkg/ts"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -47,7 +48,7 @@ const (
 	_defaultRedisUsername = ""
 	_defaultPlaceholder   = "@"
 	_defaultTsUrl         = "http://localhost:8086"
-	_defaultTsToken       = "Token VMENkkxV5mjUfIacQZ134Dw8RfHXjrKidTK_Q8ZIzqFoNECDHVbPfG5Wyh5Sl1JhZWjG3qR0S3uHh39N3Sbnsg=="
+	_defaultTsToken       = "Token p8_C7aRxDOMA3Q8lP_pbmtmRw30u7IhS9SjH6sDJuzuIMWNitOCyNBlM9lJWHQIrIZjrR51xb33_jQEftZmK_A=="
 )
 
 // var (
@@ -89,6 +90,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 
 func (o *Options) Config(stopCh <-chan struct{}) (*config.Config, error) {
 
+	o.TsToken = ensureTsTokenPrefix(o.TsToken)
 	c := &config.Config{}
 	gatewayMgr := gateway.NewGatewayManager(stopCh)
 	gatewayMgr.Init()
@@ -142,4 +144,17 @@ func parseHostPort(raw string) (string, string) {
 	}
 
 	return raw, ""
+}
+
+func ensureTsTokenPrefix(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(strings.ToLower(token), "token ") {
+		return token
+	}
+
+	return "Token " + token
 }

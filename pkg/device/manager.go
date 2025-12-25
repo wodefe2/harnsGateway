@@ -9,6 +9,7 @@ import (
 	"harnsgateway/pkg/gateway"
 	"harnsgateway/pkg/generic"
 	runtime2 "harnsgateway/pkg/protocol/modbus/runtime"
+	opcuaruntime "harnsgateway/pkg/protocol/opcua/runtime"
 	"harnsgateway/pkg/runtime"
 	"harnsgateway/pkg/runtime/constant"
 	"harnsgateway/pkg/ts"
@@ -44,6 +45,8 @@ type Manager struct {
 	closers          []runtime.LabeledCloser
 	placeholder      string
 }
+
+const fillFlagSuffix = "_fill"
 
 func NewManager(store *generic.Store, tsManager *ts.TsManager, redisClient *redis.Client, gatewayMeta *gateway.GatewayMeta, placeholder string, stop <-chan struct{}, opts ...Option) *Manager {
 	m := &Manager{
@@ -419,7 +422,8 @@ func (m *Manager) readyCollect(obj runtime.Device) error {
 							// 	klog.V(1).InfoS("Failed to publish MQTT", "topic", topic, "err", token.Error())
 							// }
 						} else {
-							v.(runtime.Device).SetCollectStatus(runtime.CollectStatusToString[runtime.CollectingError])
+							device := v.(runtime.Device)
+							device.SetCollectStatus(runtime.CollectStatusToString[runtime.CollectingError])
 							sample := summarizeErrors(pvr.Err, 3)
 							klog.V(2).InfoS("Device broker returned errors", "deviceId", deviceId, "errorCount", len(pvr.Err), "sample", sample)
 						}
@@ -605,6 +609,201 @@ func (m *Manager) switchDeviceStatus(device runtime.Device, status string) {
 	}
 }
 
+func (m *Manager) buildThingTimeSeries(device runtime.Device, markFill bool) map[string]map[string]map[string]interface{} {
+	thingTimeSeries := make(map[string]map[string]map[string]interface{}, 0)
+
+	for _, variable := range device.GetVariables() {
+		value := variable.GetValue()
+		if value == nil {
+			continue
+		}
+		deviceProperty := strings.Split(variable.GetVariableName(), m.placeholder)
+		if len(deviceProperty) < 3 {
+			klog.V(3).InfoS("Skip variable because of invalid name", "deviceId", device.GetID(), "variable", variable.GetVariableName())
+			continue
+		}
+
+		measurement := deviceProperty[0]
+		deviceCode := deviceProperty[1]
+		property := deviceProperty[2]
+
+		if _, exist := thingTimeSeries[measurement]; !exist {
+			thingTimeSeries[measurement] = map[string]map[string]interface{}{}
+		}
+
+		devicePropertyMap := thingTimeSeries[measurement]
+		if v, exist := devicePropertyMap[deviceCode]; exist {
+			v[property] = value
+			if markFill {
+				v[property+fillFlagSuffix] = true
+			}
+		} else {
+			pv := map[string]interface{}{property: value}
+			if markFill {
+				pv[property+fillFlagSuffix] = true
+			}
+			devicePropertyMap[deviceCode] = pv
+		}
+	}
+
+	return thingTimeSeries
+}
+
+func (m *Manager) writeFilledValuesToInfluxdb(device runtime.Device, timestamp time.Time) {
+	if device.GetDeviceType() != "modbus" && device.GetDeviceType() != "opcUa" {
+		return
+	}
+
+	_ = m.fillVariablesFromRedis(device)
+
+	thingTimeSeries := m.buildThingTimeSeries(device, true)
+	if len(thingTimeSeries) == 0 {
+		klog.V(3).InfoS("Skip writing fill data to influxdb because cached values are empty", "deviceId", device.GetID(), "deviceType", device.GetDeviceType())
+		return
+	}
+
+	points := make([]*write.Point, 0)
+	for measurement, ts := range thingTimeSeries {
+		m.insertIntoInfluxdb(measurement, ts, points, timestamp)
+	}
+	klog.V(2).InfoS("Inserted filled values into influxdb", "deviceId", device.GetID(), "deviceType", device.GetDeviceType(), "measurements", len(thingTimeSeries))
+}
+
+func (m *Manager) fillVariablesFromRedis(device runtime.Device) int {
+	if device.GetDeviceType() != "modbus" && device.GetDeviceType() != "opcUa" {
+		return 0
+	}
+
+	type variableRef struct {
+		property string
+		variable runtime.VariableValue
+		dataType constant.DataType
+	}
+
+	redisFields := make(map[string][]variableRef)
+
+	for _, variable := range device.GetVariables() {
+		if variable.GetValue() != nil {
+			continue
+		}
+		deviceProperty := strings.Split(variable.GetVariableName(), m.placeholder)
+		if len(deviceProperty) < 3 {
+			continue
+		}
+		dataType, ok := variableDataType(variable)
+		if !ok {
+			continue
+		}
+		key := deviceProperty[0] + m.placeholder + deviceProperty[1]
+		redisFields[key] = append(redisFields[key], variableRef{
+			property: deviceProperty[2],
+			variable: variable,
+			dataType: dataType,
+		})
+	}
+
+	filled := 0
+
+	for key, refs := range redisFields {
+		fields := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			fields = append(fields, ref.property)
+		}
+
+		values, err := m.redisClient.HMGet(context.Background(), key, fields...).Result()
+		if err != nil {
+			klog.V(2).InfoS("Failed to load last values from redis", "key", key, "err", err)
+			continue
+		}
+
+		for i, raw := range values {
+			if raw == nil {
+				continue
+			}
+			parsed, err := parseRedisValue(raw, refs[i].dataType)
+			if err != nil {
+				klog.V(3).InfoS("Failed to parse redis value for fill", "key", key, "field", refs[i].property, "err", err)
+				continue
+			}
+			refs[i].variable.SetValue(parsed)
+			filled++
+		}
+	}
+
+	return filled
+}
+
+func variableDataType(variable runtime.VariableValue) (constant.DataType, bool) {
+	switch v := variable.(type) {
+	case *runtime2.Variable:
+		return v.DataType, true
+	case *opcuaruntime.Variable:
+		return v.DataType, true
+	default:
+		return constant.STRING, false
+	}
+}
+
+func parseRedisValue(raw interface{}, dataType constant.DataType) (interface{}, error) {
+	str := fmt.Sprint(raw)
+	switch dataType {
+	case constant.BOOL:
+		if b, err := strconv.ParseBool(str); err == nil {
+			return b, nil
+		}
+		if f, err := strconv.ParseFloat(str, 64); err == nil {
+			return f != 0, nil
+		}
+		return nil, fmt.Errorf("cannot parse bool from %q", str)
+	case constant.INT16:
+		v, err := strconv.ParseInt(str, 10, 16)
+		if err != nil {
+			return nil, err
+		}
+		return int16(v), nil
+	case constant.UINT16:
+		v, err := strconv.ParseUint(str, 10, 16)
+		if err != nil {
+			return nil, err
+		}
+		return uint16(v), nil
+	case constant.INT32:
+		v, err := strconv.ParseInt(str, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		return int32(v), nil
+	case constant.INT64:
+		v, err := strconv.ParseInt(str, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		return int64(v), nil
+	case constant.FLOAT32:
+		v, err := strconv.ParseFloat(str, 32)
+		if err != nil {
+			return nil, err
+		}
+		return float32(v), nil
+	case constant.FLOAT64:
+		v, err := strconv.ParseFloat(str, 64)
+		if err != nil {
+			return nil, err
+		}
+		return float64(v), nil
+	case constant.NUMBER:
+		v, err := strconv.ParseFloat(str, 64)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
+	case constant.STRING:
+		return str, nil
+	default:
+		return nil, fmt.Errorf("unsupported data type %v", dataType)
+	}
+}
+
 func (m *Manager) processData(pds []runtime.PointData) {
 	start := time.Now()
 
@@ -648,46 +847,24 @@ func (m *Manager) Daemon() {
 	m.devices.Range(func(key, value any) bool {
 		v := value.(runtime.Device)
 
-		if v.GetCollectStatus() != runtime.CollectStatusToString[runtime.Collecting] {
-			return true
-		}
-
-		variables := v.GetVariables()
-
-		points := make([]*write.Point, 0)
-		thingTimeSeries := make(map[string]map[string]map[string]interface{}, 0)
-
-		for _, variable := range variables {
-			k := variable.GetVariableName()
-			vv := variable.GetValue()
-			if vv == nil {
-				continue
-			}
-			deviceProperty := strings.Split(k, m.placeholder)
-
-			if len(deviceProperty) < 3 {
+		switch runtime.StringToCollectStatus[v.GetCollectStatus()] {
+		case runtime.Collecting:
+			thingTimeSeries := m.buildThingTimeSeries(v, false)
+			if len(thingTimeSeries) == 0 {
 				return true
 			}
-
-			measurement := deviceProperty[0]
-			deviceCode := deviceProperty[1]
-			property := deviceProperty[2]
-
-			if _, exist := thingTimeSeries[measurement]; !exist {
-				thingTimeSeries[measurement] = map[string]map[string]interface{}{}
+			points := make([]*write.Point, 0)
+			for measurement, ts := range thingTimeSeries {
+				go m.insertIntoInfluxdb(measurement, ts, points, t)
 			}
-
-			devicePropertyMap := thingTimeSeries[measurement]
-			if v, exist := devicePropertyMap[deviceCode]; exist {
-				v[property] = vv
-			} else {
-				pv := map[string]interface{}{property: vv}
-				devicePropertyMap[deviceCode] = pv
-			}
-		}
-
-		for measurement, ts := range thingTimeSeries {
-			go m.insertIntoInfluxdb(measurement, ts, points, t)
+		case runtime.CollectingError:
+			m.writeFilledValuesToInfluxdb(v, t)
+		case runtime.Unconnected:
+			m.writeFilledValuesToInfluxdb(v, t)
+		case runtime.Error:
+			m.writeFilledValuesToInfluxdb(v, t)
+		default:
+			return true
 		}
 
 		return true
