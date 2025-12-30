@@ -4,20 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	genericruntime "harnsgateway/pkg/generic/runtime"
 	"harnsgateway/pkg/protocol/opcua/model"
 	opcuaruntime "harnsgateway/pkg/protocol/opcua/runtime"
 	"harnsgateway/pkg/runtime"
 	"harnsgateway/pkg/runtime/constant"
-	"io"
 
 	"github.com/gopcua/opcua/ua"
 	"k8s.io/klog/v2"
-
-	// "strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 var _ runtime.Broker = (*OpcUaBroker)(nil)
@@ -46,23 +46,26 @@ func NewBroker(d runtime.Device) (runtime.Broker, chan *runtime.ParseVariableRes
 
 	groupOf := genericruntime.VariablesInGroupOf[*opcuaruntime.Variable](device.Variables, 1000)
 	namespaceVariableDataFrame := make([]*OpuUaDataFrame, 0, 0)
+	variableCount := 0
 
 	for _, variables := range groupOf {
 		requestVariables := make([]*ua.ReadValueID, 0, 0)
+		validVariables := make([]*opcuaruntime.Variable, 0, len(variables))
 		for _, variable := range variables {
-			switch variable.DataType {
-			case constant.NUMBER:
-				address := variable.Address.(float64)
-				id := ua.NewNumericNodeID(variable.Namespace, uint32(address))
-				requestVariables = append(requestVariables, &ua.ReadValueID{NodeID: id})
-			case constant.STRING:
-				address := variable.Address.(string)
-				id := ua.NewStringNodeID(variable.Namespace, address)
-				requestVariables = append(requestVariables, &ua.ReadValueID{NodeID: id})
+			readValueID, err := buildReadValueID(variable)
+			if err != nil {
+				klog.V(2).InfoS("Skip OPC UA variable with invalid address", "deviceId", device.ID, "variable", variable.Name, "err", err)
+				continue
 			}
+			validVariables = append(validVariables, variable)
+			requestVariables = append(requestVariables, readValueID)
 		}
+		if len(validVariables) == 0 {
+			continue
+		}
+		variableCount += len(validVariables)
 		namespaceVariableDataFrame = append(namespaceVariableDataFrame, &OpuUaDataFrame{
-			Variables: variables,
+			Variables: validVariables,
 			RequestVariables: &ua.ReadRequest{
 				MaxAge:             2000,
 				TimestampsToReturn: ua.TimestampsToReturnBoth,
@@ -104,7 +107,7 @@ func NewBroker(d runtime.Device) (runtime.Broker, chan *runtime.ParseVariableRes
 		ExitCh:                     make(chan struct{}, 0),
 		NamespaceVariableDataFrame: namespaceVariableDataFrame,
 		VariableCh:                 make(chan *runtime.ParseVariableResult, 1),
-		VariableCount:              len(device.Variables),
+		VariableCount:              variableCount,
 		Clients:                    clients,
 	}
 	return mtc, mtc.VariableCh, nil
@@ -114,6 +117,74 @@ func (broker *OpcUaBroker) Destroy(ctx context.Context) {
 	broker.ExitCh <- struct{}{}
 	broker.Clients.Destroy(ctx)
 	close(broker.VariableCh)
+}
+
+func buildReadValueID(variable *opcuaruntime.Variable) (*ua.ReadValueID, error) {
+	switch variable.DataType {
+	case constant.NUMBER, constant.STRING:
+		// allowed
+	default:
+		return nil, fmt.Errorf("unsupported dataType %v", variable.DataType)
+	}
+
+	nodeID, err := buildNodeID(variable.Namespace, variable.Address)
+	if err != nil {
+		return nil, err
+	}
+	return &ua.ReadValueID{NodeID: nodeID}, nil
+}
+
+func parseNumericAddress(address interface{}) (uint32, error) {
+	switch v := address.(type) {
+	case uint32:
+		return v, nil
+	case uint64:
+		return uint32(v), nil
+	case uint:
+		return uint32(v), nil
+	case int:
+		return uint32(v), nil
+	case int32:
+		return uint32(v), nil
+	case int64:
+		return uint32(v), nil
+	case float32:
+		return uint32(v), nil
+	case float64:
+		return uint32(v), nil
+	case string:
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		if err != nil {
+			return 0, err
+		}
+		return uint32(n), nil
+	default:
+		return 0, fmt.Errorf("unexpected address type %T", address)
+	}
+}
+
+// buildNodeID chooses numeric or string NodeID based on the address type/content.
+// - Numeric types build a numeric NodeID.
+// - String addresses that are numeric are treated as numeric NodeIDs.
+// - Other strings are treated as string NodeIDs.
+func buildNodeID(namespace uint16, address interface{}) (*ua.NodeID, error) {
+	switch v := address.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if len(trimmed) == 0 {
+			return nil, fmt.Errorf("address is empty string")
+		}
+		if n, err := strconv.ParseUint(trimmed, 10, 32); err == nil {
+			return ua.NewNumericNodeID(namespace, uint32(n)), nil
+		}
+		return ua.NewStringNodeID(namespace, trimmed), nil
+	default:
+		addr, err := parseNumericAddress(address)
+		if err != nil {
+			return nil, err
+		}
+		return ua.NewNumericNodeID(namespace, addr), nil
+	}
 }
 
 func (broker *OpcUaBroker) Collect(ctx context.Context) {
