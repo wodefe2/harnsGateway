@@ -28,7 +28,7 @@ func (m *ModbusTcp) NewClients(address *modbus.Address, dataFrameCount int) (*mo
 		}
 		c := &modbus.TcpClient{
 			Tunnel:  tunnel,
-			Timeout: 1,
+			Timeout: 2,
 		}
 		cs.PushBack(c)
 	}
@@ -48,7 +48,7 @@ func (m *ModbusTcp) NewClients(address *modbus.Address, dataFrameCount int) (*mo
 			}
 			return &modbus.TcpClient{
 				Tunnel:  tunnel,
-				Timeout: 1,
+				Timeout: 2,
 			}, nil
 		},
 	}

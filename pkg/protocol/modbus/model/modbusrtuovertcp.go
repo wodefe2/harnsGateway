@@ -29,7 +29,7 @@ func (m *ModbusRtuOverTcp) NewClients(address *modbus.Address, dataFrameCount in
 		}
 		c := &modbus.TcpClient{
 			Tunnel:  tunnel,
-			Timeout: 1,
+			Timeout: 2,
 		}
 		cs.PushBack(c)
 	}
@@ -49,7 +49,7 @@ func (m *ModbusRtuOverTcp) NewClients(address *modbus.Address, dataFrameCount in
 			}
 			return &modbus.TcpClient{
 				Tunnel:  tunnel,
-				Timeout: 1,
+				Timeout: 2,
 			}, nil
 		},
 	}

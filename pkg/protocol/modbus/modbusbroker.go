@@ -351,13 +351,13 @@ func (broker *ModbusBroker) poll(ctx context.Context) bool {
 			frameCount += len(DataFrames)
 		}
 		klog.V(4).InfoS("Modbus poll started", "deviceId", broker.Device.ID, "frames", frameCount)
+		go broker.rollVariable(ctx, dfvCh)
 		for _, DataFrames := range broker.FunctionCodeDataFrameMap {
 			for _, frame := range DataFrames {
 				sw.Add(1)
-				go broker.message(ctx, frame, dfvCh, sw, broker.Clients)
+				broker.message(ctx, frame, dfvCh, sw, broker.Clients)
 			}
 		}
-		go broker.rollVariable(ctx, dfvCh)
 		sw.Wait()
 		close(dfvCh)
 		klog.V(4).InfoS("Modbus poll finished", "deviceId", broker.Device.ID, "frames", frameCount)

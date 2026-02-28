@@ -31,7 +31,7 @@ func (m *ModbusRtu) NewClients(address *modbus.Address, dataFrameCount int) (*mo
 
 	cs := list.New()
 	cs.PushBack(&modbus.SerialClient{
-		Timeout: 1,
+		Timeout: 2,
 		Port:    port,
 	})
 
@@ -49,7 +49,7 @@ func (m *ModbusRtu) NewClients(address *modbus.Address, dataFrameCount int) (*mo
 				return nil, err
 			}
 			return &modbus.SerialClient{
-				Timeout: 1,
+				Timeout: 2,
 				Port:    newPort,
 			}, nil
 		},
