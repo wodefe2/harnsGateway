@@ -656,7 +656,7 @@ components:
       properties:
         dataType:
           type: string
-          enum: [bool, int16, float32, float64, int32, int64, uint16]
+          enum: [bool, int16, float32, float64, int32, int64, uint16, uint32]
         name:
           type: string
         address:

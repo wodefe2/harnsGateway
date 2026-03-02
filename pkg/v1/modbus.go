@@ -4,7 +4,7 @@ import "harnsgateway/pkg/runtime/constant"
 
 // modbus
 type ModbusVariable struct {
-	DataType     string              `json:"dataType" binding:"required"`                                   // bool、int16、float32、float64、int32、int64、uint16
+	DataType     string              `json:"dataType" binding:"required"`                                   // bool、int16、float32、float64、int32、int64、uint16、uint32
 	Name         string              `json:"name" binding:"required,min=1,max=64,excludesall=\u002F\u005C"` // 变量名称
 	Address      *uint               `json:"address" binding:"required,number,gte=0"`                       // 变量地址
 	Bits         uint8               `json:"bits" binding:"gte=0,lte=7"`                                    // 位

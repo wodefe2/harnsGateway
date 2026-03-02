@@ -6,9 +6,10 @@ import (
 	modbus "harnsgateway/pkg/protocol/modbus/runtime"
 	"harnsgateway/pkg/runtime/constant"
 	"harnsgateway/pkg/utils/binutil"
-	"k8s.io/klog/v2"
 	"net"
 	"sync"
+
+	"k8s.io/klog/v2"
 )
 
 const TcpNonDataLength = 9

@@ -17,6 +17,7 @@ const (
 	UINT16
 	NUMBER
 	STRING
+	UINT32
 )
 
 var DataTypeToString = map[DataType]string{
@@ -27,6 +28,7 @@ var DataTypeToString = map[DataType]string{
 	INT32:   "int32",
 	INT64:   "int64",
 	UINT16:  "uint16",
+	UINT32:  "uint32",
 	NUMBER:  "number",
 	STRING:  "string",
 }
@@ -39,6 +41,7 @@ var StringToDataType = map[string]DataType{
 	"int32":   INT32,
 	"int64":   INT64,
 	"uint16":  UINT16,
+	"uint32":  UINT32,
 	"number":  NUMBER,
 	"string":  STRING,
 }
@@ -51,6 +54,7 @@ var DataTypeWord = map[DataType]uint{
 	INT32:   2,
 	INT64:   4,
 	UINT16:  1,
+	UINT32:  2,
 	NUMBER:  1,
 	STRING:  1,
 }

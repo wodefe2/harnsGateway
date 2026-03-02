@@ -773,6 +773,12 @@ func parseRedisValue(raw interface{}, dataType constant.DataType) (interface{}, 
 			return nil, err
 		}
 		return int32(v), nil
+	case constant.UINT32:
+		v, err := strconv.ParseUint(str, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		return uint32(v), nil
 	case constant.INT64:
 		v, err := strconv.ParseInt(str, 10, 64)
 		if err != nil {

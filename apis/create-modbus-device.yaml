@@ -217,6 +217,7 @@ components:
                   - int32
                   - int64
                   - uint16
+                  - uint32
                 example: int32
               address:
                 type: integer

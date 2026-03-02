@@ -2,7 +2,6 @@ package modbus
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"harnsgateway/pkg/apis/response"
 	"harnsgateway/pkg/protocol/modbus/model"
@@ -11,12 +10,13 @@ import (
 	"harnsgateway/pkg/runtime/constant"
 	"harnsgateway/pkg/utils/binutil"
 	"harnsgateway/pkg/utils/crcutil"
-	"k8s.io/klog/v2"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
 /**
@@ -31,6 +31,9 @@ tcp报文头(6)  +  地址(1)   +   pdu(253)   +  16位校验(2)  = 262
 
 // ModBusDataFrame 报文对应的数据点位
 var _ runtime.Broker = (*ModbusBroker)(nil)
+
+// endpointMessageLocks 按 ip:port 维度串行化 Modbus 报文发送。
+var endpointMessageLocks sync.Map
 
 type ModbusBroker struct {
 	NeedCheckTransaction     bool
@@ -243,6 +246,13 @@ func (broker *ModbusBroker) DeliverAction(ctx context.Context, obj map[string]in
 			default:
 				return response.ErrInteger32Invalid(name)
 			}
+		case constant.UINT32:
+			switch value.(type) {
+			case float64:
+				v.Value = uint32(value.(float64))
+			default:
+				return response.ErrInteger32Invalid(name)
+			}
 		case constant.INT64:
 			switch value.(type) {
 			case float64:
@@ -382,7 +392,8 @@ func (broker *ModbusBroker) message(ctx context.Context, dataFrame *modbus.ModBu
 	}
 
 	var buf []byte
-	klog.V(4).InfoS("Modbus frame request", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "startAddress", dataFrame.StartAddress, "maxDataSize", dataFrame.MaxDataSize)
+	lockKey := broker.endpointLockKey()
+	klog.V(2).InfoS("Modbus frame request", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "startAddress", dataFrame.StartAddress, "maxDataSize", dataFrame.MaxDataSize)
 
 	if err := broker.retry(func(messenger modbus.Messenger, dataFrame *modbus.ModBusDataFrame) error {
 		if broker.NeedCheckTransaction {
@@ -390,14 +401,14 @@ func (broker *ModbusBroker) message(ctx context.Context, dataFrame *modbus.ModBu
 		}
 		_, err := messenger.AskAtLeast(dataFrame.DataFrame, dataFrame.ResponseDataFrame, 6)
 		if err != nil {
-			return modbus.ErrModbusBadConn
+			return err
 		}
 		buf, err = broker.ValidateAndExtractMessage(dataFrame)
 		if err != nil {
-			return modbus.ErrModbusServerBadResp
+			return err
 		}
 		return nil
-	}, messenger, dataFrame); err != nil {
+	}, messenger, dataFrame, lockKey); err != nil {
 		klog.V(2).InfoS("Failed to collect modbus frame", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "startAddress", dataFrame.StartAddress, "error", err)
 		pvrCh <- &modbus.ParseVariableResult{Err: []error{err}}
 		return
@@ -406,7 +417,11 @@ func (broker *ModbusBroker) message(ctx context.Context, dataFrame *modbus.ModBu
 	pvrCh <- &modbus.ParseVariableResult{Err: nil, VariableSlice: dataFrame.ParseVariableValue(buf)}
 }
 
-func (broker *ModbusBroker) retry(fun func(messenger modbus.Messenger, dataFrame *modbus.ModBusDataFrame) error, messenger modbus.Messenger, dataFrame *modbus.ModBusDataFrame) error {
+func (broker *ModbusBroker) retry(fun func(messenger modbus.Messenger, dataFrame *modbus.ModBusDataFrame) error, messenger modbus.Messenger, dataFrame *modbus.ModBusDataFrame, lockKey string) error {
+	locker := getEndpointMessageLocker(lockKey)
+	locker.Lock()
+	defer locker.Unlock()
+
 	for i := 0; i < 3; i++ {
 		err := fun(messenger, dataFrame)
 		if err == nil {
@@ -414,20 +429,64 @@ func (broker *ModbusBroker) retry(fun func(messenger modbus.Messenger, dataFrame
 				klog.V(4).InfoS("Modbus frame recovered after retry", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1)
 			}
 			return nil
-		} else if errors.Is(err, modbus.ErrModbusBadConn) {
-			messenger.Close()
-			newMessenger, err := broker.Clients.NewMessenger()
-			if err != nil {
-				return err
-			}
-			messenger.Reset(newMessenger)
-			klog.V(3).InfoS("Modbus messenger recreated", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1)
 		} else {
-			klog.V(2).InfoS("Modbus frame attempt failed", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1, "error", err)
+			exceptionCode, ok := broker.extractRawExceptionCode(dataFrame.ResponseDataFrame)
+			if ok {
+				klog.V(2).InfoS("Modbus frame attempt failed", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1, "error", err, "rawExceptionCode", exceptionCode)
+			} else {
+				klog.V(2).InfoS("Modbus frame attempt failed", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode, "attempt", i+1, "error", err)
+				messenger.Close()
+				newMessenger, err := broker.Clients.NewMessenger()
+				if err != nil {
+					return err
+				}
+				messenger.Reset(newMessenger)
+			}
 		}
 	}
 	klog.V(2).InfoS("Modbus frame exhausted retries", "deviceId", broker.Device.ID, "functionCode", dataFrame.FunctionCode)
 	return modbus.ErrManyRetry
+}
+
+func getEndpointMessageLocker(lockKey string) *sync.Mutex {
+	locker, _ := endpointMessageLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	return locker.(*sync.Mutex)
+}
+
+func (broker *ModbusBroker) endpointLockKey() string {
+	if broker == nil || broker.Device == nil || broker.Device.Address == nil {
+		return ":0"
+	}
+	port := 0
+	if broker.Device.Address.Option != nil {
+		port = broker.Device.Address.Option.Port
+	}
+	return fmt.Sprintf("%s:%d", broker.Device.Address.Location, port)
+}
+
+// extractRawExceptionCode 从原始响应报文中直接提取 Modbus 异常码。
+// 实现原理：
+// 1) 先按协议模型定位 PDU：Modbus TCP 需要跳过 6 字节 MBAP 头；RTU/RTU-over-TCP 直接使用原始数据。
+// 2) 做最小长度校验，避免访问 response[1]/response[2] 越界。
+// 3) 通过功能码最高位判断是否异常帧（fc & 0x80 != 0）。
+// 4) 异常帧第 3 个字节就是异常码（exception code），例如 5；提取成功返回 (code, true)。
+func (broker *ModbusBroker) extractRawExceptionCode(response []byte) (uint8, bool) {
+	if broker.NeedCheckTransaction {
+		if len(response) < 9 {
+			return 0, false
+		}
+		response = response[6:]
+	} else if len(response) < 3 {
+		return 0, false
+	}
+
+	if len(response) < 3 || response[1]&0x80 == 0 {
+		return 0, false
+	}
+	if response[2] == 0 {
+		return 0, false
+	}
+	return response[2], true
 }
 
 func (broker *ModbusBroker) ValidateAndExtractMessage(df *modbus.ModBusDataFrame) ([]byte, error) {
@@ -569,6 +628,13 @@ func (broker *ModbusBroker) generateActionBytes(memoryLayout constant.MemoryLayo
 				} else {
 					dataByte = append(dataByte, binutil.Uint16ToBytesBigEndian(uint16(0))...)
 				}
+			case constant.UINT32:
+				fc = byte(modbus.WriteSingleCoil)
+				if variable.Value.(uint32) > 0 {
+					dataByte = append(dataByte, binutil.Uint16ToBytesBigEndian(uint16(65280))...)
+				} else {
+					dataByte = append(dataByte, binutil.Uint16ToBytesBigEndian(uint16(0))...)
+				}
 			case constant.INT64:
 				fc = byte(modbus.WriteSingleCoil)
 				if variable.Value.(int64) > 0 {
@@ -648,6 +714,29 @@ func (broker *ModbusBroker) generateActionBytes(memoryLayout constant.MemoryLayo
 					dataByte = append(dataByte, binutil.Uint32ToBytesLittleEndianByteSwap(uint32(value))...)
 				case constant.DCBA:
 					dataByte = append(dataByte, binutil.Uint32ToBytesLittleEndian(uint32(value))...)
+				}
+			case constant.UINT32:
+				fc = byte(modbus.WriteMultipleRegister)
+				registerAmount := 2
+				dataByte = append(dataByte, binutil.Uint16ToBytesBigEndian(uint16(registerAmount))...)
+				dataByte = append(dataByte, byte(2*registerAmount))
+
+				var value uint32
+				if variable.Rate != 0 && variable.Rate != 1 {
+					value = uint32(float64(variable.Value.(uint32)) * variable.Rate)
+				} else {
+					value = variable.Value.(uint32)
+				}
+				switch memoryLayout {
+				case constant.ABCD:
+					dataByte = append(dataByte, binutil.Uint32ToBytesBigEndian(value)...)
+				case constant.BADC:
+					// 大端交换
+					dataByte = append(dataByte, binutil.Uint32ToBytesBigEndianByteSwap(value)...)
+				case constant.CDAB:
+					dataByte = append(dataByte, binutil.Uint32ToBytesLittleEndianByteSwap(value)...)
+				case constant.DCBA:
+					dataByte = append(dataByte, binutil.Uint32ToBytesLittleEndian(value)...)
 				}
 			case constant.INT64:
 				fc = byte(modbus.WriteMultipleRegister)

@@ -12,7 +12,7 @@ var _ runtime.Device = (*ModBusDevice)(nil)
 var _ runtime.VariableValue = (*Variable)(nil)
 
 type Variable struct {
-	DataType     constant.DataType   `json:"dataType"`               // bool、int16、float32、float64、int32、int64、uint16
+	DataType     constant.DataType   `json:"dataType"`               // bool、int16、float32、float64、int32、int64、uint16、uint32
 	Name         string              `json:"name"`                   // 变量名称
 	Address      uint                `json:"address"`                // 变量地址
 	Bits         uint8               `json:"bits"`                   // 位 1、2、3、4、5、6、7、8、9、10、11、12、13、14、15、16
@@ -158,6 +158,8 @@ func (df *ModBusDataFrame) ParseVariableValue(data []byte) []*Variable {
 				value = float32(data[vp.Start])
 			case constant.FLOAT64:
 				value = float64(data[vp.Start])
+			case constant.UINT32:
+				value = uint32(data[vp.Start])
 			}
 		case ReadInputRegister, ReadHoldRegister:
 			vpData := data[vp.Start:]
@@ -212,6 +214,24 @@ func (df *ModBusDataFrame) ParseVariableValue(data []byte) []*Variable {
 				}
 				if vp.Variable.Rate != 0 && vp.Variable.Rate != 1 {
 					value = int32((v.(float64)) * vp.Variable.Rate)
+				} else {
+					value = v
+				}
+			case constant.UINT32:
+				var v uint32
+				switch df.MemoryLayout {
+				case constant.ABCD:
+					v = binutil.ParseUint32BigEndian(vpData)
+				case constant.BADC:
+					// 大端交换
+					v = binutil.ParseUint32BigEndianByteSwap(vpData)
+				case constant.CDAB:
+					v = binutil.ParseUint32LittleEndianByteSwap(vpData)
+				case constant.DCBA:
+					v = binutil.ParseUint32LittleEndian(vpData)
+				}
+				if vp.Variable.Rate != 0 && vp.Variable.Rate != 1 {
+					value = uint32(float64(v) * vp.Variable.Rate)
 				} else {
 					value = v
 				}
