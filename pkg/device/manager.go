@@ -16,6 +16,8 @@ import (
 	v1 "harnsgateway/pkg/v1"
 	"mime/multipart"
 	"os"
+	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,7 +48,23 @@ type Manager struct {
 	placeholder      string
 }
 
-const fillFlagSuffix = "_fill"
+const (
+	fillFlagSuffix                = "_fill"
+	redisFillWarnMissingThreshold = 50
+	redisFillWarnFieldThreshold   = 200
+	daemonStepWarnThreshold       = 3 * time.Second
+	daemonRoundWarnThreshold      = 10 * time.Second
+	redisHMGetWarnThreshold       = 3 * time.Second
+)
+
+type redisFillStats struct {
+	MissingVariables int
+	RedisKeys        int
+	RequestedFields  int
+	Filled           int
+	ReadErrors       int
+	ParseErrors      int
+}
 
 func NewManager(store *generic.Store, tsManager *ts.TsManager, redisClient *redis.Client, gatewayMeta *gateway.GatewayMeta, placeholder string, stop <-chan struct{}, opts ...Option) *Manager {
 	m := &Manager{
@@ -650,29 +668,73 @@ func (m *Manager) buildThingTimeSeries(device runtime.Device, markFill bool) map
 }
 
 func (m *Manager) writeFilledValuesToInfluxdb(device runtime.Device, timestamp time.Time) {
-	if device.GetDeviceType() != "modbus" && device.GetDeviceType() != "opcUa" {
+	start := time.Now()
+	deviceID := device.GetID()
+	deviceType := device.GetDeviceType()
+	klog.V(2).InfoS("writeFilledValuesToInfluxdb started", "deviceId", deviceID, "deviceType", deviceType, "collectStatus", device.GetCollectStatus())
+
+	if deviceType != "modbus" && deviceType != "opcUa" {
+		klog.V(3).InfoS("Skip writeFilledValuesToInfluxdb because unsupported device type", "deviceId", deviceID, "deviceType", deviceType)
 		return
 	}
 
-	_ = m.fillVariablesFromRedis(device)
+	fillStart := time.Now()
+	fillStats := m.fillVariablesFromRedis(device)
+	fillElapsed := time.Since(fillStart)
+	if fillElapsed >= daemonStepWarnThreshold {
+		klog.V(1).InfoS("writeFilledValuesToInfluxdb fillVariablesFromRedis is slow", "deviceId", deviceID, "deviceType", deviceType, "elapsedMs", fillElapsed.Milliseconds())
+	} else {
+		klog.V(2).InfoS("writeFilledValuesToInfluxdb fillVariablesFromRedis finished", "deviceId", deviceID, "deviceType", deviceType, "elapsedMs", fillElapsed.Milliseconds())
+	}
+	if fillStats.MissingVariables > 0 {
+		klog.V(2).InfoS("Redis backfill applied for non-collecting device",
+			"deviceId", deviceID,
+			"deviceType", deviceType,
+			"missingVariables", fillStats.MissingVariables,
+			"filled", fillStats.Filled,
+			"redisKeys", fillStats.RedisKeys,
+			"requestedFields", fillStats.RequestedFields,
+			"readErrors", fillStats.ReadErrors,
+			"parseErrors", fillStats.ParseErrors)
+	}
 
+	buildStart := time.Now()
 	thingTimeSeries := m.buildThingTimeSeries(device, true)
+	buildElapsed := time.Since(buildStart)
+	klog.V(2).InfoS("writeFilledValuesToInfluxdb buildThingTimeSeries finished", "deviceId", deviceID, "deviceType", deviceType, "measurements", len(thingTimeSeries), "elapsedMs", buildElapsed.Milliseconds())
 	if len(thingTimeSeries) == 0 {
-		klog.V(3).InfoS("Skip writing fill data to influxdb because cached values are empty", "deviceId", device.GetID(), "deviceType", device.GetDeviceType())
+		klog.V(3).InfoS("Skip writing fill data to influxdb because cached values are empty", "deviceId", deviceID, "deviceType", deviceType)
 		return
 	}
 
 	points := make([]*write.Point, 0)
 	for measurement, ts := range thingTimeSeries {
+		measurementStart := time.Now()
 		m.insertIntoInfluxdb(measurement, ts, points, timestamp)
+		measurementElapsed := time.Since(measurementStart)
+		if measurementElapsed >= daemonStepWarnThreshold {
+			klog.V(1).InfoS("writeFilledValuesToInfluxdb measurement write is slow", "deviceId", deviceID, "deviceType", deviceType, "measurement", measurement, "elapsedMs", measurementElapsed.Milliseconds(), "thingCodes", len(ts))
+		} else {
+			klog.V(2).InfoS("writeFilledValuesToInfluxdb measurement write finished", "deviceId", deviceID, "deviceType", deviceType, "measurement", measurement, "elapsedMs", measurementElapsed.Milliseconds(), "thingCodes", len(ts))
+		}
 	}
-	klog.V(2).InfoS("Inserted filled values into influxdb", "deviceId", device.GetID(), "deviceType", device.GetDeviceType(), "measurements", len(thingTimeSeries))
+	totalElapsed := time.Since(start)
+	if totalElapsed >= daemonStepWarnThreshold {
+		klog.V(1).InfoS("writeFilledValuesToInfluxdb finished slowly", "deviceId", deviceID, "deviceType", deviceType, "measurements", len(thingTimeSeries), "elapsedMs", totalElapsed.Milliseconds())
+	} else {
+		klog.V(2).InfoS("writeFilledValuesToInfluxdb finished", "deviceId", deviceID, "deviceType", deviceType, "measurements", len(thingTimeSeries), "elapsedMs", totalElapsed.Milliseconds())
+	}
 }
 
-func (m *Manager) fillVariablesFromRedis(device runtime.Device) int {
-	if device.GetDeviceType() != "modbus" && device.GetDeviceType() != "opcUa" {
-		return 0
+func (m *Manager) fillVariablesFromRedis(device runtime.Device) redisFillStats {
+	start := time.Now()
+	stats := redisFillStats{}
+	deviceID := device.GetID()
+	deviceType := device.GetDeviceType()
+	if deviceType != "modbus" && deviceType != "opcUa" {
+		return stats
 	}
+	klog.V(3).InfoS("fillVariablesFromRedis started", "deviceId", deviceID, "deviceType", deviceType)
 
 	type variableRef struct {
 		property string
@@ -686,6 +748,7 @@ func (m *Manager) fillVariablesFromRedis(device runtime.Device) int {
 		if variable.GetValue() != nil {
 			continue
 		}
+		stats.MissingVariables++
 		deviceProperty := strings.Split(variable.GetVariableName(), m.placeholder)
 		if len(deviceProperty) < 3 {
 			continue
@@ -702,16 +765,23 @@ func (m *Manager) fillVariablesFromRedis(device runtime.Device) int {
 		})
 	}
 
-	filled := 0
-
 	for key, refs := range redisFields {
+		stats.RedisKeys++
+		stats.RequestedFields += len(refs)
+
 		fields := make([]string, 0, len(refs))
 		for _, ref := range refs {
 			fields = append(fields, ref.property)
 		}
 
+		hmGetStart := time.Now()
 		values, err := m.redisClient.HMGet(context.Background(), key, fields...).Result()
+		hmGetElapsed := time.Since(hmGetStart)
+		if hmGetElapsed >= redisHMGetWarnThreshold {
+			klog.V(1).InfoS("Redis HMGet is slow", "deviceId", deviceID, "deviceType", deviceType, "key", key, "fields", len(fields), "elapsedMs", hmGetElapsed.Milliseconds(), "err", err)
+		}
 		if err != nil {
+			stats.ReadErrors++
 			klog.V(2).InfoS("Failed to load last values from redis", "key", key, "err", err)
 			continue
 		}
@@ -722,15 +792,23 @@ func (m *Manager) fillVariablesFromRedis(device runtime.Device) int {
 			}
 			parsed, err := parseRedisValue(raw, refs[i].dataType)
 			if err != nil {
+				stats.ParseErrors++
 				klog.V(3).InfoS("Failed to parse redis value for fill", "key", key, "field", refs[i].property, "err", err)
 				continue
 			}
 			refs[i].variable.SetValue(parsed)
-			filled++
+			stats.Filled++
 		}
 	}
 
-	return filled
+	elapsed := time.Since(start)
+	if elapsed >= daemonStepWarnThreshold {
+		klog.V(1).InfoS("fillVariablesFromRedis finished slowly", "deviceId", deviceID, "deviceType", deviceType, "elapsedMs", elapsed.Milliseconds(), "missingVariables", stats.MissingVariables, "filled", stats.Filled, "redisKeys", stats.RedisKeys, "requestedFields", stats.RequestedFields, "readErrors", stats.ReadErrors, "parseErrors", stats.ParseErrors)
+	} else {
+		klog.V(2).InfoS("fillVariablesFromRedis finished", "deviceId", deviceID, "deviceType", deviceType, "elapsedMs", elapsed.Milliseconds(), "missingVariables", stats.MissingVariables, "filled", stats.Filled, "redisKeys", stats.RedisKeys, "requestedFields", stats.RequestedFields, "readErrors", stats.ReadErrors, "parseErrors", stats.ParseErrors)
+	}
+
+	return stats
 }
 
 func variableDataType(variable runtime.VariableValue) (constant.DataType, bool) {
@@ -841,40 +919,114 @@ func (m *Manager) processData(pds []runtime.PointData) {
 }
 
 func (m *Manager) Daemon() {
+	roundStart := time.Now()
 	// now := time.Now()
 	loc, _ := time.LoadLocation("UTC")
 
 	t := time.Now().In(loc)
 	t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, loc)
+	klog.V(2).InfoS("Daemon round started", "roundAt", t.Format(time.RFC3339))
+	visited := 0
 
 	// points := make([]*write.Point, 0)
 	// thingTimeSeries := make(map[string]map[string]interface{}, 0)
 
-	m.devices.Range(func(key, value any) bool {
-		v := value.(runtime.Device)
+	m.devices.Range(func(key, value any) (cont bool) {
+		visited++
+		cont = true
+		deviceStart := time.Now()
+		defer func() {
+			if r := recover(); r != nil {
+				err, ok := r.(error)
+				if !ok {
+					err = fmt.Errorf("%v", r)
+				}
+				klog.ErrorS(err, "Recovered panic while iterating device in daemon", "key", key, "valueType", fmt.Sprintf("%T", value), "stack", string(debug.Stack()))
+				cont = true
+			}
+		}()
 
-		switch runtime.StringToCollectStatus[v.GetCollectStatus()] {
+		v := value.(runtime.Device)
+		deviceID := v.GetID()
+		collectStatus := v.GetCollectStatus()
+		klog.V(2).InfoS("Daemon iterating device", "deviceId", deviceID, "deviceType", fmt.Sprintf("%T", v), "collectStatus", collectStatus)
+
+		switch runtime.StringToCollectStatus[collectStatus] {
 		case runtime.Collecting:
+			fillStart := time.Now()
+			fillStats := m.fillVariablesFromRedis(v)
+			fillElapsed := time.Since(fillStart)
+			if fillElapsed >= daemonStepWarnThreshold {
+				klog.V(1).InfoS("Daemon collecting fillVariablesFromRedis is slow", "deviceId", deviceID, "elapsedMs", fillElapsed.Milliseconds())
+			} else {
+				klog.V(2).InfoS("Daemon collecting fillVariablesFromRedis finished", "deviceId", deviceID, "elapsedMs", fillElapsed.Milliseconds())
+			}
+			if fillStats.MissingVariables > 0 {
+				if fillStats.MissingVariables >= redisFillWarnMissingThreshold || fillStats.RequestedFields >= redisFillWarnFieldThreshold {
+					klog.V(1).InfoS("Redis backfill pressure warning",
+						"deviceId", deviceID,
+						"deviceType", v.GetDeviceType(),
+						"missingVariables", fillStats.MissingVariables,
+						"filled", fillStats.Filled,
+						"redisKeys", fillStats.RedisKeys,
+						"requestedFields", fillStats.RequestedFields,
+						"readErrors", fillStats.ReadErrors,
+						"parseErrors", fillStats.ParseErrors,
+						"missingThreshold", redisFillWarnMissingThreshold,
+						"fieldThreshold", redisFillWarnFieldThreshold)
+				} else {
+					klog.V(2).InfoS("Redis backfill applied in collecting state",
+						"deviceId", deviceID,
+						"deviceType", v.GetDeviceType(),
+						"missingVariables", fillStats.MissingVariables,
+						"filled", fillStats.Filled,
+						"redisKeys", fillStats.RedisKeys,
+						"requestedFields", fillStats.RequestedFields,
+						"readErrors", fillStats.ReadErrors,
+						"parseErrors", fillStats.ParseErrors)
+				}
+			}
+
+			buildStart := time.Now()
 			thingTimeSeries := m.buildThingTimeSeries(v, false)
+			buildElapsed := time.Since(buildStart)
+			klog.V(2).InfoS("Daemon collecting buildThingTimeSeries finished", "deviceId", deviceID, "measurements", len(thingTimeSeries), "elapsedMs", buildElapsed.Milliseconds())
 			if len(thingTimeSeries) == 0 {
 				return true
 			}
+			dispatchStart := time.Now()
 			points := make([]*write.Point, 0)
 			for measurement, ts := range thingTimeSeries {
 				go m.insertIntoInfluxdb(measurement, ts, points, t)
 			}
-		case runtime.CollectingError:
+			dispatchElapsed := time.Since(dispatchStart)
+			klog.V(2).InfoS("Daemon collecting dispatched influx writes", "deviceId", deviceID, "measurements", len(thingTimeSeries), "elapsedMs", dispatchElapsed.Milliseconds())
+		case runtime.CollectingError, runtime.Unconnected, runtime.Error:
+			writeStart := time.Now()
 			m.writeFilledValuesToInfluxdb(v, t)
-		case runtime.Unconnected:
-			m.writeFilledValuesToInfluxdb(v, t)
-		case runtime.Error:
-			m.writeFilledValuesToInfluxdb(v, t)
+			writeElapsed := time.Since(writeStart)
+			if writeElapsed >= daemonStepWarnThreshold {
+				klog.V(1).InfoS("Daemon writeFilledValuesToInfluxdb is slow", "deviceId", deviceID, "collectStatus", collectStatus, "elapsedMs", writeElapsed.Milliseconds())
+			} else {
+				klog.V(2).InfoS("Daemon writeFilledValuesToInfluxdb finished", "deviceId", deviceID, "collectStatus", collectStatus, "elapsedMs", writeElapsed.Milliseconds())
+			}
 		default:
 			return true
 		}
-
+		deviceElapsed := time.Since(deviceStart)
+		if deviceElapsed >= daemonStepWarnThreshold {
+			klog.V(1).InfoS("Daemon device iteration finished slowly", "deviceId", deviceID, "collectStatus", collectStatus, "elapsedMs", deviceElapsed.Milliseconds())
+		} else {
+			klog.V(2).InfoS("Daemon device iteration finished", "deviceId", deviceID, "collectStatus", collectStatus, "elapsedMs", deviceElapsed.Milliseconds())
+		}
 		return true
 	})
+	roundElapsed := time.Since(roundStart)
+	if roundElapsed >= daemonRoundWarnThreshold {
+		klog.V(1).InfoS("Daemon round finished slowly", "visitedDevices", visited, "elapsedMs", roundElapsed.Milliseconds())
+	} else {
+		klog.V(2).InfoS("Daemon round finished", "visitedDevices", visited, "elapsedMs", roundElapsed.Milliseconds())
+	}
 
 	// m.insertIntoInfluxdb(thingTimeSeries, points, t)
 
@@ -883,14 +1035,51 @@ func (m *Manager) Daemon() {
 func (m *Manager) insertIntoInfluxdb(measurement string, thingTimeSeries map[string]map[string]interface{}, points []*write.Point, t time.Time) {
 	start := time.Now()
 	initialLen := len(points)
+	klog.V(3).InfoS("Insert into influxdb started", "measurement", measurement, "thingCodes", len(thingTimeSeries))
 	for thingCode, kv := range thingTimeSeries {
-		point := write.NewPoint(measurement, map[string]string{"ti": thingCode}, kv, t)
+		point := write.NewPoint(measurement, map[string]string{"ti": thingCode}, normalizeInfluxNumericFields(kv), t)
 		points = append(points, point)
 	}
-	m.tsManager.SaveOrUpdateTimeSeries(points)
+	saveStart := time.Now()
+	klog.V(2).InfoS("Insert into influxdb calling SaveOrUpdateTimeSeries", "measurement", measurement, "points", len(points))
+	if err := m.tsManager.SaveOrUpdateTimeSeries(points); err != nil {
+		klog.ErrorS(err, "Failed to SaveOrUpdateTimeSeries", "measurement", measurement, "points", len(points))
+	}
+	saveElapsed := time.Since(saveStart)
+	if saveElapsed >= daemonStepWarnThreshold {
+		klog.V(1).InfoS("Insert into influxdb SaveOrUpdateTimeSeries is slow", "measurement", measurement, "points", len(points), "elapsedMs", saveElapsed.Milliseconds())
+	} else {
+		klog.V(2).InfoS("Insert into influxdb SaveOrUpdateTimeSeries finished", "measurement", measurement, "points", len(points), "elapsedMs", saveElapsed.Milliseconds())
+	}
 	end := time.Now()
 	written := len(points) - initialLen
 	klog.V(3).InfoS("Insert into influxdb", "measurement", measurement, "thingCodes", len(thingTimeSeries), "points", written, "durationSeconds", end.Sub(start).Seconds())
+}
+
+func normalizeInfluxNumericFields(fields map[string]interface{}) map[string]interface{} {
+	normalized := make(map[string]interface{}, len(fields))
+	for key, value := range fields {
+		normalized[key] = toFloat64IfNumber(value)
+	}
+	return normalized
+}
+
+func toFloat64IfNumber(value interface{}) interface{} {
+	if value == nil {
+		return nil
+	}
+
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return float64(rv.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return float64(rv.Uint())
+	case reflect.Float32, reflect.Float64:
+		return rv.Float()
+	default:
+		return value
+	}
 }
 
 func summarizeErrors(errs []error, limit int) string {

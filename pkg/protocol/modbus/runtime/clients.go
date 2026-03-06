@@ -3,6 +3,7 @@ package runtime
 import (
 	"container/list"
 	"context"
+	"encoding/hex"
 	"go.bug.st/serial"
 	"harnsgateway/pkg/runtime/constant"
 	"io"
@@ -134,7 +135,7 @@ func (tc *TcpClient) Close() {
 func (tc *TcpClient) AskAtLeast(request []byte, response []byte, min int) (int, error) {
 	_, err := tc.Tunnel.Write(request)
 	if err != nil {
-		klog.V(2).InfoS("Failed to ask message", "error", err)
+		klog.V(2).InfoS("Failed to ask message", "error", err, "requestHex", hex.EncodeToString(request))
 		return 0, ErrModbusBadConn
 	}
 	// 设置读超时
